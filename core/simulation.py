@@ -101,10 +101,10 @@ class Simulation:
 
     def run(self, save_interval):
         """
-        Запуск симуляции столкновения с критерием остановки при малых изменениях
+        Запуск симуляции столкновения
         
         Args:
-            save_interval (float): Интервал сохранения состояния
+            save_interval (int): Количество шагов между сохранениями состояния
         
         Returns:
             tuple: (times, trajectories, velocities_history)
@@ -125,32 +125,23 @@ class Simulation:
             rtol=self.epsilon, atol=self.epsilon
         )
 
-        num_save_points = int(self.t_end / save_interval) + 1
-        save_times = np.linspace(0, self.t_end, num_save_points)
-
         self.times = [0]
         self.trajectories = [np.array([n.position for n in self.nucleons])]
         self.velocities_history = [np.array([n.velocity for n in self.nucleons])]
 
         initial_cluster_ids = [n.cluster_id for n in self.nucleons]
 
-        next_save_idx = 1
-
         print(f"Начало симуляции: {N} нуклонов")
-        print(f"Запланировано {num_save_points} точек сохранения с интервалом {save_interval}")
+        print(f"Сохранение каждые {save_interval} шагов")
         start_time = time.time()
         
-        prev_positions = None
-        prev_velocities = None
-        convergence_counter = 0
-        max_convergence_count = 3
-        time_cur = time.time()
-        time_prev = start_time
+        step_count = 0
+        
         while integrator.status == 'running':
             integrator.step()
+            step_count += 1
 
-            if next_save_idx < len(save_times) and integrator.t >= save_times[next_save_idx]:
-
+            if step_count % save_interval == 0:
                 current_state = integrator.y
                 current_positions = current_state[:N * 3].reshape(N, 3)
                 current_velocities = current_state[N * 3:].reshape(N, 3)
@@ -159,35 +150,15 @@ class Simulation:
                     nucleon.position = current_positions[i]
                     nucleon.velocity = current_velocities[i]
 
-                self.times.append(save_times[next_save_idx])
+                self.times.append(integrator.t)
                 self.trajectories.append(current_positions.copy())
                 self.velocities_history.append(current_velocities.copy())
-                time_cur = time.time()
-                print(
-                    f"t = {round(save_times[next_save_idx], -1 * round(np.log10(save_interval)))}/{self.t_end} ({100 * save_times[next_save_idx] / self.t_end:.1f}%) Времени прошло {time.time()- start_time:.2f} секунд, {time_cur - time_prev:.2f}")
-
-                if prev_positions is not None and prev_velocities is not None:
-                    pos_change = np.max(np.abs(current_positions - prev_positions))
-                    vel_change = np.max(np.abs(current_velocities - prev_velocities))
-                    
-                    max_change = max(pos_change, vel_change)
-                    
-                    if max_change < self.convergence_threshold or time_cur - time_prev > self.delta_time:
-                        convergence_counter += 1
-                        print(f"Обнаружена сходимость (изменение: {max_change:.6f}), проверка {convergence_counter}/{max_convergence_count}")
-                        
-                        if convergence_counter >= max_convergence_count:
-                            print(f"Симуляция остановлена из-за сходимости (изменение < {self.convergence_threshold})")
-                            break
-                    else:
-                        convergence_counter = 0
                 
-                prev_positions = current_positions.copy()
-                prev_velocities = current_velocities.copy()
-                time_prev = time_cur
-                next_save_idx += 1
+                elapsed_time = time.time() - start_time
+                print(f"Шаг {step_count}, t = {integrator.t:.4f}, прошло времени: {elapsed_time:.2f} сек")
 
-        if self.times[-1] < self.t_end:
+        # Сохраняем последнее состояние, если оно не было сохранено
+        if step_count % save_interval != 0:
             current_state = integrator.y
             current_positions = current_state[:N * 3].reshape(N, 3)
             current_velocities = current_state[N * 3:].reshape(N, 3)
@@ -200,13 +171,12 @@ class Simulation:
             self.trajectories.append(current_positions.copy())
             self.velocities_history.append(current_velocities.copy())
 
-            print(f"t = {integrator.t:.2f}/{self.t_end} ({100 * integrator.t / self.t_end:.1f}%)")
-
         for i, nucleon in enumerate(self.nucleons):
             nucleon.cluster_id = initial_cluster_ids[i]
 
         end_time = time.time()
         print(f"Симуляция завершена за {end_time - start_time:.2f} секунд")
+        print(f"Выполнено {step_count} шагов, сохранено {len(self.times)} состояний")
 
         return self.times, self.trajectories, self.velocities_history
 
@@ -254,7 +224,7 @@ class Simulation:
             ax.set_ylabel('Y')
             ax.set_zlabel('Z')
             min_c = np.min([np.min(positions[:, 0]), np.min(positions[:, 1]), np.min(positions[:, 2])])
-            max_c = np.min([np.max(positions[:, 0]), np.max(positions[:, 1]), np.max(positions[:, 2])])
+            max_c = np.max([np.max(positions[:, 0]), np.max(positions[:, 1]), np.max(positions[:, 2])])
             ax.set_xlim(min_c, max_c)
             ax.set_ylim(min_c, max_c)
             ax.set_zlim(min_c, max_c)
