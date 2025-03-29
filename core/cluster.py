@@ -5,7 +5,7 @@ from scipy.spatial.distance import pdist, squareform
 class Cluster:
     """Класс, представляющий кластер нуклонов"""
     
-    def __init__(self, nucleons=None, position=None, velocity=None, radius=None, N=None):
+    def __init__(self, nucleons=None, position=None, velocity=None, radius=None, N=None, random_velocity=None):
         """
         Инициализация кластера
         
@@ -34,7 +34,9 @@ class Cluster:
                 
                 nucleon = Nucleon(position=pos, velocity=np.zeros(3), mass=1.0)
                 self.nucleons.append(nucleon)
-            
+
+            if random_velocity is not None:
+                self.add_random_velocity(random_velocity)
             if velocity is not None:
                 self.add_velocity(velocity)
         else:
@@ -94,6 +96,13 @@ class Cluster:
         """Добавление скорости ко всем нуклонам кластера"""
         for nucleon in self.nucleons:
             nucleon.velocity += velocity
+
+    def add_random_velocity(self, velocity):
+        """Добавление случайной скорости ко всем нуклонам кластера"""
+        for nucleon in self.nucleons:
+            random_vector = np.random.normal(size=3)
+            unit_vector = random_vector / np.linalg.norm(random_vector)
+            nucleon.velocity += velocity * unit_vector
     
     def add_random_rotation(self, omega_scale=0.1):
         """Добавление случайного вращения к кластеру"""
