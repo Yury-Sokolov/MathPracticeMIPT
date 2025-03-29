@@ -121,8 +121,10 @@ class Simulation:
 
         integrator = RK45(
             self.system_dynamics,
-            0, initial_state, self.t_end,
-            rtol=self.epsilon, atol=self.epsilon
+            0,
+            initial_state,
+            self.t_end,
+            rtol=self.epsilon,
         )
 
         self.times = [0]
@@ -155,7 +157,7 @@ class Simulation:
                 self.velocities_history.append(current_velocities.copy())
                 
                 elapsed_time = time.time() - start_time
-                print(f"Шаг {step_count}, t = {integrator.t:.4f}, прошло времени: {elapsed_time:.2f} сек")
+                print(f"Шаг {step_count}, t = {integrator.t:.4f}, прошло времени: {elapsed_time:.2f} сек", end='\r')
 
         # Сохраняем последнее состояние, если оно не было сохранено
         if step_count % save_interval != 0:
@@ -180,7 +182,7 @@ class Simulation:
 
         return self.times, self.trajectories, self.velocities_history
 
-    def create_animation(self, filename=None, fps=10):
+    def create_animation(self, filename=None, fps=1, limit = 10):
         """
         Создание анимации столкновения с сохранением исходных цветов кластеров
         
@@ -218,16 +220,14 @@ class Simulation:
                     ax.plot(traj[:, 0], traj[:, 1], traj[:, 2],
                             c=cluster_colors[nucleon.cluster_id], alpha=0.3)
 
-            ax.set_title(f't = {round(self.times[frame], -1 * round(np.log10(self.save_interval)))}')
+            ax.set_title(f't = {self.times[frame]:.5f}')
 
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
             ax.set_zlabel('Z')
-            min_c = np.min([np.min(positions[:, 0]), np.min(positions[:, 1]), np.min(positions[:, 2])])
-            max_c = np.max([np.max(positions[:, 0]), np.max(positions[:, 1]), np.max(positions[:, 2])])
-            ax.set_xlim(min_c, max_c)
-            ax.set_ylim(min_c, max_c)
-            ax.set_zlim(min_c, max_c)
+            ax.set_xlim(-limit, limit)
+            ax.set_ylim(-limit, limit)
+            ax.set_zlim(-limit, limit)
 
             return ax,
 
@@ -242,7 +242,7 @@ class Simulation:
 
         return ani
 
-    def cluster_analysis(self, clustering_algorithm, save_path=None):
+    def cluster_analysis(self, clustering_algorithm, save_path=None, limit=10):
         """
         Анализ кластеров с использованием алгоритма из sklearn
         
@@ -283,6 +283,9 @@ class Simulation:
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(-limit, limit)
+        ax.set_zlim(-limit, limit)
         ax.legend()
 
         if save_path:
