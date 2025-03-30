@@ -90,7 +90,7 @@ class Simulation:
         
         dot_rv = torch.sum(r_ij * v_ij, dim=2)  # [N, N]
         
-        mask = (r > 1e-10) & (r < self.potential.r1)
+        mask = (r > 1e-10) & (r < self.potential.r_cuttoff)
         
         m_i = masses.unsqueeze(1)
         m_j = masses.unsqueeze(0)
