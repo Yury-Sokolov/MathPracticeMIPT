@@ -115,12 +115,12 @@ class Simulation:
                 i, j = i_indices[idx], j_indices[idx]
                 direction = directions[i, j]
                 
-                f_prime_r_ij_val = 0.0
-                f_double_prime_r_ij_val = 0.0
+                f_prime_r_ij_val = torch.tensor(0.0, device=self.device)
+                f_double_prime_r_ij_val = torch.tensor(0.0, device=self.device)
                 
                 for a in range(3):
                     for b in range(3):
-                        f_prime_r_ij_val += f_prime[i, a, b] * direction[a] * direction[b]
+                        f_prime_r_ij_val += f_prime[i, j, a, b] * direction[a] * direction[b]
                         
                         for c in range(3):
                             f_double_prime_r_ij_val += f_double_prime[i, a, b, c] * direction[a] * direction[b] * direction[c]
