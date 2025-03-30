@@ -1,1 +1,1 @@
-from .potential import Potential, YukawaPotential
+from .potential import ModifiedYukawaPotential

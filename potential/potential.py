@@ -1,105 +1,147 @@
-import numpy as np
-from abc import ABC, abstractmethod
-import matplotlib.pyplot as plt
+import torch
+import torch.func as func
 
-class Potential(ABC):
-    """Абстрактный класс для потенциалов взаимодействия"""
-    
-    @abstractmethod
-    def compute(self, r):
-        """Вычисляет потенциал на расстоянии r"""
-        pass
-    
-    @abstractmethod
-    def compute_force(self, r):
-        """Вычисляет силу на расстоянии r"""
-        pass
-    
-    def plot(self, r_min=0.01, r_max=10.0, num_points=1000, show_force=True, figsize=(10, 6), save_path=None):
-        """
-        Строит график потенциала и силы от расстояния
-        
-        Параметры:
-        ----------
-        r_min : float
-            Минимальное расстояние для графика
-        r_max : float
-            Максимальное расстояние для графика
-        num_points : int
-            Количество точек для построения графика
-        show_force : bool
-            Показывать ли график силы
-        figsize : tuple
-            Размер графика (ширина, высота) в дюймах
-        save_path : str, optional
-            Путь для сохранения графика. Если None, график не сохраняется
-        """
-        r_values = np.linspace(r_min, r_max, num_points)
-        potential_values = self.compute(r_values)
-        
-        fig, ax1 = plt.subplots(figsize=figsize)
-        
-        # График потенциала
-        ax1.plot(r_values, potential_values, 'b-', label='Потенциал V(r)')
-        ax1.set_xlabel('Расстояние r')
-        ax1.set_ylabel('Потенциал V(r)')
-        ax1.tick_params(axis='y')
-        
-        if show_force:
-            # График силы на второй оси Y
-            force_values = self.compute_force(r_values)
-            ax2 = ax1.twinx()
-            ax2.plot(r_values, force_values, 'r-', label='Сила F(r)')
-            ax2.set_ylabel('Сила F(r)',)
-            ax2.tick_params(axis='y')
-        
-        # Добавление заголовка и легенды
-        plt.title('Зависимость потенциала и силы от расстояния')
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        if show_force:
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
-        else:
-            ax1.legend(loc='best')
-        
-        plt.grid(True)
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        
-        plt.show()
-        
-        return fig, ax1
 
-class YukawaPotential(Potential):
-    """Потенциал Юкавы: V(r) = V0 * exp(-alpha*r) / r"""
-    
-    def __init__(self, V0, alpha, r1):
+class ModifiedYukawaPotential(torch.nn.Module):
+    def __init__(self, V0, alpha, r1, V_rep, beta, r_core, device):
+        """
+        Модифицированный потенциал Юкавы с отталкивающей частью
+        
+        Args:
+            V0 (float): Глубина притягивающей части потенциала
+            alpha (float): Параметр затухания притягивающей части
+            r1 (float): Радиус обрезания потенциала
+            V_rep (float): Сила отталкивающей части потенциала
+            beta (float): Параметр затухания отталкивающей части (больше alpha)
+            r_core (float): Радиус кора (отталкивающей части)
+            device (str): Устройство для вычислений ('cpu' или 'cuda')
+        """
+        super().__init__()
         self.V0 = V0
         self.alpha = alpha
         self.r1 = r1
-    
-    def compute(self, r):
+        self.V_rep = V_rep
+        self.beta = beta
+        self.r_core = r_core
+        self.device = device
+        
+        self._compute_compiled = torch.compile(self.compute)
+        self._compute_derivatives_compiled = torch.compile(self._compute_derivatives_impl)
 
-        r_safe = np.maximum(r, 1e-10)
+    def compute(self, r):
+        """
+        Вычисляет потенциал для заданного расстояния
         
-        potential = self.V0 * np.exp(-self.alpha * r_safe) / r_safe
+        Args:
+            r (torch.Tensor): Расстояние между частицами
+            
+        Returns:
+            torch.Tensor: Значение потенциала
+        """
+        r_safe = torch.clamp(r, min=1e-10)
         
-        potential = np.where(r_safe < self.r1, potential, 0.0)
+        attractive = self.V0 * torch.exp(-self.alpha * r_safe) / r_safe
         
-        return potential
-    
+        repulsive = self.V_rep * torch.exp(-self.beta * r_safe) / r_safe
+        
+        return torch.where(
+            r_safe < self.r1,
+            repulsive - attractive,  # Отталкивание - притяжение
+            torch.zeros_like(r)
+        )
+
     def compute_force(self, r):
         """
-        Сила, соответствующая потенциалу Юкавы: F(r) = -∇V(r)
-        Аналитическое дифференцирование:
-        F(r) = -V0 * exp(-alpha*r) * (1/r^2 + alpha/r)
+        Вычисляет силу для заданного расстояния, используя автоматическое дифференцирование
+        
+        Args:
+            r (torch.Tensor): Расстояние между частицами
+            
+        Returns:
+            torch.Tensor: Значение силы
         """
-        r_safe = np.maximum(r, 1e-10)
+        r_tensor = r.detach().clone().requires_grad_(True)
+        potential = self.compute(r_tensor)
         
-        force_magnitude =  self.V0 * np.exp(-self.alpha * r_safe) * (1/r_safe**2 + self.alpha/r_safe)
+        force = -torch.autograd.grad(
+            potential.sum(), r_tensor, create_graph=True
+        )[0]
         
-        force_magnitude = np.where(r_safe < self.r1, force_magnitude, 0.0)
+        return force
+
+    def _compute_derivatives_impl(self, positions):
+        """
+        Внутренняя реализация для вычисления производных потенциала
+        """
+        N = positions.shape[0]
         
-        return force_magnitude
+        r_ij = positions.unsqueeze(1) - positions.unsqueeze(0)  # [N, N, 3]
+        distances = torch.norm(r_ij, dim=2)  # [N, N]
+        
+        mask = (distances > 1e-10) & (distances < self.r1)
+        
+        if not torch.any(mask):
+            return (
+                torch.zeros_like(positions),
+                torch.zeros((N, 3, 3), device=self.device),
+                torch.zeros((N, 3, 3, 3), device=self.device)
+            )
+        
+        def potential_energy(pos):
+            r_ij = pos.unsqueeze(1) - pos.unsqueeze(0)  # [N, N, 3]
+            distances = torch.norm(r_ij, dim=2)  # [N, N]
+            mask = (distances > 1e-10) & (distances < self.r1)
+            
+            r_safe = torch.clamp(distances, min=1e-10)
+            attractive = self.V0 * torch.exp(-self.alpha * r_safe) / r_safe
+            repulsive = self.V_rep * torch.exp(-self.beta * r_safe) / r_safe
+            pair_potential = torch.where(mask, repulsive - attractive, torch.zeros_like(distances))
+            
+            return torch.sum(torch.triu(pair_potential, diagonal=1))
+        
+        forces = -func.grad(potential_energy)(positions)
+        
+        hessian = func.hessian(potential_energy)(positions)
+        f_prime = hessian.reshape(N, 3, N, 3).permute(0, 2, 1, 3)
+        
+        def compute_third_derivatives(pos):
+            return func.jacfwd(func.jacrev(func.grad(potential_energy)))(pos)
+        
+        f_double_prime = compute_third_derivatives(positions)
+        f_double_prime = f_double_prime.reshape(N, 3, N, 3, N, 3).permute(0, 2, 4, 1, 3, 5)
+        f_double_prime = f_double_prime.reshape(N, 3, 3, 3)
+        
+        return forces, f_prime, f_double_prime
+
+    def compute_derivatives(self, positions):
+        """
+        Вычисляет производные потенциала для всех частиц
+        
+        Args:
+            positions (torch.Tensor): Позиции частиц [N, 3]
+            
+        Returns:
+            tuple: (силы, вторые производные, третьи производные)
+        """
+        return self._compute_derivatives_compiled(positions)
+
+    def compute_energy_per_particle(self, positions):
+        """
+        Вычисляет потенциальную энергию для каждой частицы
+        
+        Args:
+            positions (torch.Tensor): Позиции частиц [N, 3]
+            
+        Returns:
+            torch.Tensor: Потенциальная энергия каждой частицы [N]
+        """
+        N = positions.shape[0]
+        
+        distances = torch.cdist(positions, positions)
+        
+        potential_matrix = self._compute_compiled(distances)
+        
+        mask = torch.ones_like(potential_matrix) - torch.eye(N, device=self.device)
+        potential_matrix = potential_matrix * mask
+        
+        return torch.sum(potential_matrix, dim=1) / 2

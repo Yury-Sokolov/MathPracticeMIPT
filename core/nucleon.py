@@ -1,21 +1,26 @@
-import numpy as np
+import torch
 
 class Nucleon:
     """Класс, представляющий нуклон (частицу) в симуляции"""
     
-    def __init__(self, position=None, velocity=None, mass=1.0):
+    def __init__(self, position=None, velocity=None, mass=1.0, device='cuda', dtype=torch.float32):
         """
         Инициализация нуклона
         
         Args:
-            position (np.ndarray): Начальная позиция [x, y, z]
-            velocity (np.ndarray): Начальная скорость [vx, vy, vz]
+            position (torch.Tensor): Начальная позиция [x, y, z]
+            velocity (torch.Tensor): Начальная скорость [vx, vy, vz]
             mass (float): Масса нуклона
+            device: Устройство для вычислений (cpu/cuda)
+            dtype: Тип данных тензоров
         """
-        self.position = np.zeros(3) if position is None else np.array(position)
-        self.velocity = np.zeros(3) if velocity is None else np.array(velocity)
-        self.force = np.zeros(3)
-        self.mass = mass
+        self.device = device
+        self.dtype = dtype
+        
+        self.position = torch.zeros(3, device=device, dtype=dtype) if position is None else position.to(device, dtype)
+        self.velocity = torch.zeros(3, device=device, dtype=dtype) if velocity is None else velocity.to(device, dtype)
+        self.force = torch.zeros(3, device=device, dtype=dtype)
+        self.mass = torch.tensor(mass, device=device, dtype=dtype)
         self.cluster_id = -1
     
     def update_position(self, dt):
@@ -28,4 +33,4 @@ class Nucleon:
     
     def kinetic_energy(self):
         """Вычисление кинетической энергии нуклона"""
-        return 0.5 * self.mass * np.sum(self.velocity**2)
+        return 0.5 * self.mass * torch.sum(self.velocity**2)

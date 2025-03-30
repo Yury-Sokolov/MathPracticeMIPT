@@ -1,168 +1,218 @@
-import time
-
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
-from scipy.spatial.distance import pdist, squareform
-
-from .cluster import Cluster
+import torch
 
 
 class Simulation:
-    """Класс для управления симуляцией столкновения кластеров"""
-
-    def __init__(self, potential, epsilon=1e-5, t_end=200.0, convergence_threshold=1e-3, clip_force=1000):
-        """
-        Инициализация симуляции
-        
-        Args:
-            potential: Объект потенциала взаимодействия
-            epsilon (float): Параметр точности для адаптивного метода Рунге-Кутты
-            t_end (float): Время окончания симуляции
-            convergence_threshold (float): Порог для остановки симуляции при малых изменениях
-        """
+    def __init__(self, potential, t_end, device='cuda', Imax=0.1, tau_max=0.01,
+                 dt_min=1e-10):
         self.potential = potential
-        self.epsilon = epsilon
+        self.Imax = Imax
+        self.tau_max = tau_max
+        self.dt_min = dt_min
         self.t_end = t_end
-        self.convergence_threshold = convergence_threshold
+        self.device = device
+        self.eta = 0.1
         self.clusters = []
-        self.nucleons = []
+        self.nucleons = {
+            'positions': None,
+            'velocities': None,
+            'masses': None,
+            'cluster_ids': None
+        }
+
         self.times = []
         self.trajectories = []
         self.velocities_history = []
-        self.save_interval = 0
-        self.clip_force = clip_force
+        
+        self._compute_adaptive_dt_compiled = torch.compile(self._compute_adaptive_dt_impl)
+        self._update_positions_velocities = torch.compile(self._update_positions_velocities_impl)
 
     def add_cluster(self, cluster):
         """
         Добавление кластера в симуляцию
         
         Args:
-            cluster (Cluster): Кластер для добавления
+            cluster (Cluster): Объект кластера для добавления
         """
-
+        positions = cluster.positions
+        velocities = cluster.velocities
+        masses = cluster.masses
+        
+        cluster_id = len(self.clusters)
         self.clusters.append(cluster)
-        self.nucleons.extend(cluster.nucleons)
-
-    def compute_forces(self):
-        """Вычисление сил между всеми нуклонами"""
-        positions = np.array([n.position for n in self.nucleons])
-
-        for nucleon in self.nucleons:
-            nucleon.force = np.zeros(3)
-
-        distances = squareform(pdist(positions))
         
-        mask = distances < self.potential.r1
-        np.fill_diagonal(mask, False)
+        cluster_ids = torch.full((positions.shape[0],), cluster_id, 
+                                 dtype=torch.long, device=self.device)
+        
+        if self.nucleons['positions'] is None:
+            self.nucleons['positions'] = positions.to(self.device)
+            self.nucleons['velocities'] = velocities.to(self.device)
+            self.nucleons['masses'] = masses.to(self.device)
+            self.nucleons['cluster_ids'] = cluster_ids
+        else:
+            self.nucleons['positions'] = torch.cat([
+                self.nucleons['positions'],
+                positions.to(self.device)
+            ], dim=0)
+            self.nucleons['velocities'] = torch.cat([
+                self.nucleons['velocities'],
+                velocities.to(self.device)
+            ], dim=0)
+            self.nucleons['masses'] = torch.cat([
+                self.nucleons['masses'],
+                masses.to(self.device)
+            ], dim=0)
+            self.nucleons['cluster_ids'] = torch.cat([
+                self.nucleons['cluster_ids'],
+                cluster_ids
+            ], dim=0)
 
-        interacting_pairs = np.where(mask)
+    def compute_forces(self, positions):
+        forces, f_prime, f_double_prime = self.potential.compute_derivatives(positions)
+        return forces / self.nucleons['masses'].unsqueeze(1), f_prime, f_double_prime
 
-        for i, j in zip(*interacting_pairs):
-            if i < j:
-                r = distances[i, j]
-                direction = (positions[i] - positions[j]) / r
-
-                force_magnitude = self.potential.compute_force(r)
+    def _compute_adaptive_dt_impl(self, velocities, f, f_prime, f_double_prime):
+        """
+        Оптимизированная реализация вычисления адаптивного шага времени
+        """
+        positions = self.nucleons['positions']
+        masses = self.nucleons['masses']
+        N = positions.shape[0]
+        
+        r_ij = positions.unsqueeze(1) - positions.unsqueeze(0)  # [N, N, 3]
+        r = torch.norm(r_ij, dim=2)  # [N, N]
+        
+        v_ij = velocities.unsqueeze(1) - velocities.unsqueeze(0)  # [N, N, 3]
+        v = torch.norm(v_ij, dim=2)  # [N, N]
+        
+        dot_rv = torch.sum(r_ij * v_ij, dim=2)  # [N, N]
+        
+        mask = (r > 1e-10) & (r < self.potential.r1)
+        
+        m_i = masses.unsqueeze(1)
+        m_j = masses.unsqueeze(0)
+        mu = (m_i * m_j) / (m_i + m_j)
+        
+        nonzero_r = r.unsqueeze(-1).expand_as(r_ij)
+        nonzero_r = torch.where(nonzero_r > 1e-10, nonzero_r, torch.ones_like(nonzero_r))
+        directions = r_ij / nonzero_r
+        
+        f_diff = f.unsqueeze(1) - f.unsqueeze(0)  # [N, N, 3]
+        f_ij = torch.norm(f_diff, dim=2)  # [N, N]
+        
+        f_prime_r_ij = torch.zeros((N, N), device=self.device)
+        f_double_prime_r_ij = torch.zeros((N, N), device=self.device)
+        S = torch.zeros_like(r)
+        
+        valid_pairs = torch.triu(mask, diagonal=1)
+        i_indices, j_indices = torch.where(valid_pairs)
+        
+        if len(i_indices) > 0:
+            for idx in range(len(i_indices)):
+                i, j = i_indices[idx], j_indices[idx]
+                direction = directions[i, j]
                 
-                force = force_magnitude * direction
-                self.nucleons[i].force += force
-                self.nucleons[j].force -= force
-
-    def run(self, save_interval, dt):
-        """
-        Запуск симуляции столкновения с использованием метода Leapfrog
+                f_prime_r_ij_val = 0.0
+                f_double_prime_r_ij_val = 0.0
+                
+                for a in range(3):
+                    for b in range(3):
+                        f_prime_r_ij_val += f_prime[i, a, b] * direction[a] * direction[b]
+                        
+                        for c in range(3):
+                            f_double_prime_r_ij_val += f_double_prime[i, a, b, c] * direction[a] * direction[b] * direction[c]
+                
+                f_prime_r_ij[i, j] = f_prime_r_ij_val
+                f_prime_r_ij[j, i] = f_prime_r_ij_val
+                f_double_prime_r_ij[i, j] = f_double_prime_r_ij_val
+                f_double_prime_r_ij[j, i] = f_double_prime_r_ij_val
+                
+                term1_ij = (dot_rv[i, j]**3 / r[i, j]**5) * (
+                    r[i, j] * f_prime_r_ij[i, j] - f_ij[i, j] - (r[i, j]**2 * f_double_prime_r_ij[i, j]) / 3
+                )
+                
+                term2_ij = (dot_rv[i, j] / (mu[i, j] * r[i, j]**3)) * (
+                    mu[i, j] * v[i, j]**2 * (f_ij[i, j] - r[i, j] * f_prime_r_ij[i, j]) - 
+                    r[i, j]**2 * f_ij[i, j] * f_prime_r_ij[i, j]
+                )
+                
+                S[i, j] = term1_ij + term2_ij
+                S[j, i] = S[i, j]
         
-        Args:
-            save_interval (int): Количество шагов между сохранениями состояния
-            dt (float): Шаг времени для интегрирования
+        tau_ij = torch.ones_like(r) * self.tau_max
         
-        Returns:
-            tuple: (times, trajectories, velocities_history)
+        nonzero_S = (torch.abs(S) > 1e-10) & mask
+        if torch.any(nonzero_S):
+            tau_ij[nonzero_S] = 2 * torch.sqrt(self.Imax / torch.abs(S[nonzero_S]))
+        
+        min_tau = torch.min(tau_ij + torch.eye(N, device=self.device) * self.tau_max)
+        
+        dt = torch.clamp(min_tau, self.dt_min, self.tau_max)
+        
+        return dt
+
+    def compute_adaptive_dt(self, velocities, f, f_prime, f_double_prime):
         """
-        N = len(self.nucleons)
-        self.save_interval = save_interval
-        if N == 0:
-            print("Ошибка: нет нуклонов для симуляции")
-            return [], [], []
+        Вычисление адаптивного шага времени на основе динамики системы
+        """
+        return self._compute_adaptive_dt_compiled(velocities, f, f_prime, f_double_prime)
 
-        self.times = [0]
-        self.trajectories = [np.array([n.position for n in self.nucleons])]
-        self.velocities_history = [np.array([n.velocity for n in self.nucleons])]
-        kinetic_energies, potential_energies, total_energies = self.compute_total_energy_per_nucleon()
-        for i in range(N):
-            nucleon =self.nucleons[i]
-            print(f"Нуклон {i}, x {nucleon.position[0]:.2f}, y {nucleon.position[1]:.2f} z {nucleon.position[2]:.2f} Kinetic {kinetic_energies[i]:.2f} Potential {potential_energies[i]:.2f} Total {total_energies[i]:.2f} ")
-        initial_cluster_ids = [n.cluster_id for n in self.nucleons]
+    def _update_positions_velocities_impl(self, positions, velocities, a_prev, dt):
+        """
+        Оптимизированная реализация обновления позиций и скоростей
+        """
+        new_positions = positions + velocities * dt + 0.5 * a_prev * dt ** 2
+        forces, f_prime, f_double_prime = self.compute_forces(new_positions)
+        a_new = forces
+        new_velocities = velocities + 0.5 * (a_prev + a_new) * dt
+        
+        return new_positions, new_velocities, a_new, f_prime, f_double_prime
 
-        t = 0
+    def run(self, save_interval, dt_initial, max_steps):
+        positions = self.nucleons['positions']
+        velocities = self.nucleons['velocities']
+        
+        self.times = [0.0]
+        self.trajectories = [positions.cpu().detach().numpy()]
+        self.velocities_history = [velocities.cpu().detach().numpy()]
 
-        print(f"Начало симуляции: {N} нуклонов")
-        print(f"Сохранение каждые {save_interval} шагов")
-        print(f"Шаг времени: {dt}")
-        start_time = time.time()
-
+        t = 0.0
+        dt = dt_initial
         step_count = 0
 
-        self.compute_forces()
-        with tqdm(total=int(self.t_end/dt)) as pb:
-            while t < self.t_end:
-                if self.clip_force > 0:
-                    for nucleon in self.nucleons:
-                        force_magnitude = np.linalg.norm(nucleon.force)
-                        if force_magnitude > self.clip_force:
-                           nucleon.force = (nucleon.force / force_magnitude) * self.clip_force
+        forces, f_prime, f_double_prime = self.compute_forces(positions)
+        a_prev = forces
 
-                for nucleon in self.nucleons:
-                    nucleon.velocity += nucleon.force / nucleon.mass * dt / 2
-
-                for nucleon in self.nucleons:
-                    nucleon.position += nucleon.velocity * dt
-
-                positions = np.array([n.position for n in self.nucleons])
-                distances = squareform(pdist(positions))
-                min_distance = 0.00001
-
-                for i in range(N):
-                    for j in range(i+1, N):
-                        if distances[i, j] < min_distance:
-                            direction = positions[i] - positions[j]
-                            direction_norm = np.linalg.norm(direction)
-                            if direction_norm > 0:
-                                direction = direction / direction_norm
-                                displacement = (min_distance - distances[i, j]) / 2
-                                self.nucleons[i].position += displacement * direction
-                                self.nucleons[j].position -= displacement * direction
-
-                self.compute_forces()
-                if self.clip_force > 0:
-                    for nucleon in self.nucleons:
-                        force_magnitude = np.linalg.norm(nucleon.force)
-                        if force_magnitude > self.clip_force:
-                            nucleon.force = (nucleon.force / force_magnitude) * self.clip_force
-
-                for nucleon in self.nucleons:
-                    nucleon.velocity += nucleon.force / nucleon.mass * dt / 2
+        with tqdm(total=max_steps) as pb:
+            while t < self.t_end and step_count < max_steps:
+                positions, velocities, a_new, f_prime, f_double_prime = self._update_positions_velocities(
+                    positions, velocities, a_prev, dt
+                )
+                
+                dt = self.compute_adaptive_dt(velocities, a_new, f_prime, f_double_prime)
 
                 t += dt
                 step_count += 1
-                pb.update()
+
                 if step_count % save_interval == 0:
                     self.times.append(t)
-                    self.trajectories.append(np.array([n.position for n in self.nucleons]))
-                    self.velocities_history.append(np.array([n.velocity for n in self.nucleons]))
+                    self.trajectories.append(positions.cpu().detach().numpy())
+                    self.velocities_history.append(velocities.cpu().detach().numpy())
 
+                    pb.update(save_interval)
+                    pb.set_description(
+                        f"t={t:.3f}, dt={dt:.3e}, progress={100 * t / self.t_end:.1f}%"
+                    )
 
+                a_prev = a_new
 
+        self.nucleons['positions'] = positions
+        self.nucleons['velocities'] = velocities
 
-        for i, nucleon in enumerate(self.nucleons):
-            nucleon.cluster_id = initial_cluster_ids[i]
-
-        end_time = time.time()
-        print(f"\nСимуляция завершена за {end_time - start_time:.2f} секунд")
-        print(f"Выполнено {step_count} шагов, сохранено {len(self.times)} состояний")
-
+        print(f"Simulation completed at t={t:.3f}")
         return self.times, self.trajectories, self.velocities_history
 
     def create_animation(self, filename=None, fps=1, limit=10):
@@ -185,20 +235,23 @@ class Simulation:
         ax.set_ylabel('Y')
         ax.set_zlabel('Z')
 
-        nucleons = self.nucleons
-        trajectories =np.asarray(self.trajectories)
+        trajectories = np.asarray(self.trajectories)
         frames_count = len(self.times)
-        n_particles = len(nucleons)
+        n_particles = trajectories[0].shape[0]
+        
+        cluster_ids = self.nucleons['cluster_ids'].cpu().numpy()
+        unique_clusters = np.unique(cluster_ids)
+        cluster_colors = plt.cm.jet(np.linspace(0, 1, len(unique_clusters)))
 
-        unique_cids = list({n.cluster_id for n in nucleons})
-        colors = plt.cm.jet(np.linspace(0, 1, len(unique_cids)))
-        color_map = {cid: color for cid, color in zip(unique_cids, colors)}
-        particle_colors = [color_map[n.cluster_id] for n in nucleons]
-
+        colors = np.zeros((n_particles, 4))
+        for i, cluster_id in enumerate(unique_clusters):
+            mask = cluster_ids == cluster_id
+            colors[mask] = cluster_colors[i]
+        
         scatter = ax.scatter([], [], [], s=50, alpha=0.8)
-        lines = [ax.plot([], [], [], c=color, alpha=0.3)[0] for color in particle_colors]
+        lines = [ax.plot([], [], [], c=colors[i], alpha=0.3)[0] for i in range(n_particles)]
 
-        scatter.set_facecolors(particle_colors)
+        scatter.set_facecolors(colors)
         pb = tqdm(total=len(trajectories))
         def update(frame):
             current_positions = trajectories[frame]
@@ -277,7 +330,6 @@ class Simulation:
         ax.set_xlim(-limit, limit)
         ax.set_ylim(-limit, limit)
         ax.set_zlim(-limit, limit)
-        ax.legend()
 
         if save_path:
             plt.savefig(save_path)
@@ -292,54 +344,53 @@ class Simulation:
         Вычисление кинетической энергии для каждого нуклона
         
         Returns:
-            list: Список кинетических энергий каждого нуклона
+            np.ndarray: Массив кинетических энергий каждого нуклона
         """
-        kinetic_energies = []
-        for nucleon in self.nucleons:
-            velocity_squared = np.sum(nucleon.velocity**2)
-            kinetic_energy = 0.5 * nucleon.mass * velocity_squared
-            kinetic_energies.append(kinetic_energy)
+        if not self.velocities_history:
+            print("Ошибка: нет данных о скоростях")
+            return None
+        
+        velocities = self.velocities_history[-1]  # Последние скорости
+        masses = self.nucleons['masses'].cpu().numpy()
+        
+        # Вычисление квадрата скорости для каждого нуклона
+        velocities_squared = np.sum(velocities**2, axis=1)
+        
+        # Вычисление кинетической энергии
+        kinetic_energies = 0.5 * masses * velocities_squared
         
         return kinetic_energies
-    
+
     def compute_potential_energy_per_nucleon(self):
         """
         Вычисление потенциальной энергии для каждого нуклона
         
         Returns:
-            list: Список потенциальных энергий каждого нуклона
+            np.ndarray: Массив потенциальных энергий каждого нуклона
         """
-        positions = np.array([n.position for n in self.nucleons])
-        distances = squareform(pdist(positions))
+        if not self.trajectories:
+            print("Ошибка: нет данных о позициях")
+            return None
         
-        potential_energies = [0.0] * len(self.nucleons)
+        positions = torch.tensor(self.trajectories[-1], device=self.device)
+        potential_energies = self.potential.compute_energy_per_particle(positions)
         
-        mask = distances < self.potential.r1
-        np.fill_diagonal(mask, False)
-        
-        interacting_pairs = np.where(mask)
-        
-        for i, j in zip(*interacting_pairs):
-            if i < j:
-                r = distances[i, j]
-                pair_potential = self.potential.compute(r)
-                
-                potential_energies[i] += pair_potential / 2
-                potential_energies[j] += pair_potential / 2
-        
-        return potential_energies
-    
+        return potential_energies.cpu().numpy()
+
     def compute_total_energy_per_nucleon(self):
         """
         Вычисление полной энергии для каждого нуклона
         
         Returns:
-            tuple: (список кинетических энергий, список потенциальных энергий, 
-                   список полных энергий)
+            tuple: (массив кинетических энергий, массив потенциальных энергий, 
+                   массив полных энергий)
         """
         kinetic_energies = self.compute_kinetic_energy_per_nucleon()
         potential_energies = self.compute_potential_energy_per_nucleon()
         
-        total_energies = [k + p for k, p in zip(kinetic_energies, potential_energies)]
+        if kinetic_energies is None or potential_energies is None:
+            return None, None, None
+        
+        total_energies = kinetic_energies + potential_energies
         
         return kinetic_energies, potential_energies, total_energies
