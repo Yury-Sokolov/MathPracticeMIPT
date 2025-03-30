@@ -2,19 +2,19 @@ import torch
 from sklearn.cluster import DBSCAN
 
 from core import Cluster, Simulation
-from potential import ModifiedYukawaPotential
+from potential import MesonExchangePotential
 
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
     device = torch.device('cuda')
-    potential = ModifiedYukawaPotential(
-        V0=-10.0,
-        alpha=1.0,
-        r1=3.0,
-        V_rep=-20.0,
-        beta=5.0,
+    potential = MesonExchangePotential(
+        g_att= 13.5,
+        g_rep= 20.0,
+        m_pi= 0.70,
+        m_rho=3.93,
+        r_cutoff= 5.0,
         r_core=0.3,
-        device=device
+        device= 'cuda'
     )
     sim = Simulation(potential, dt_min=1e-16, t_end=1., device=device)
 

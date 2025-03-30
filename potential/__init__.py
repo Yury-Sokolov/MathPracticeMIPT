@@ -1,1 +1,1 @@
-from .potential import ModifiedYukawaPotential
+from .potential import MesonExchangePotential
