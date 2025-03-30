@@ -103,19 +103,31 @@ class ModifiedYukawaPotential(torch.nn.Module):
         
         hessian = func.hessian(potential_energy)(positions)
         f_prime = hessian.reshape(N, 3, N, 3).permute(0, 2, 1, 3)
-        
-        f_double_prime_diag = torch.zeros((N, 3, 3, 3), device=self.device)
+
+        f_double_prime = torch.zeros((N, 3, 3, 3), device=self.device)
         
         for i in range(N):
-            def single_particle_potential(pos_i):
-                pos_copy = positions.clone().detach()
+            def force_i(pos_i):
+                pos_copy = positions.clone()
                 pos_copy[i] = pos_i
-                return potential_energy(pos_copy)
+                energy = potential_energy(pos_copy)
+                return -torch.autograd.grad(energy, pos_copy, create_graph=True)[0][i]
             
-            third_derivatives = func.jacfwd(func.jacrev(func.grad(single_particle_potential)))(positions[i])
-            f_double_prime_diag[i] = third_derivatives
+            for a in range(3):
+                def force_ia(pos_i):
+                    return force_i(pos_i)[a]
+
+                for b in range(3):
+                    def grad_force_iab(pos_i):
+                        return torch.autograd.grad(force_ia(pos_i), pos_i, create_graph=True)[0][b]
+                    
+                    pos_i = positions[i].clone().detach().requires_grad_(True)
+                    grad_force_iab_val = grad_force_iab(pos_i)
+                    hessian_force_iab = torch.autograd.grad(grad_force_iab_val, pos_i, create_graph=False)[0]
+                    
+                    f_double_prime[i, a, b] = hessian_force_iab
         
-        return forces, f_prime, f_double_prime_diag
+        return forces, f_prime, f_double_prime
 
     def compute_derivatives(self, positions):
         """
