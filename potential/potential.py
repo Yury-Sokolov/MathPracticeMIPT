@@ -61,13 +61,25 @@ class ModifiedYukawaPotential(torch.nn.Module):
         f_double_prime = torch.zeros((N, 3, 3, 3), device=self.device)
 
         for i in range(N):
-            pos_i = positions[i].detach().requires_grad_(True)
+            def force_func_i(pos):
+                batch_pos = torch.cat([positions[:i], pos.unsqueeze(0), positions[i+1:]])
+                return -func.grad(potential_energy)(batch_pos)[i]
+            
             for a in range(3):
-                force_i_a = -func.grad(lambda x: potential_energy(x.unsqueeze(0).unsqueeze(0))[i, a])
-                grad_force_i_a = func.grad(force_i_a)(pos_i)
+                def force_func_i_a(pos):
+                    return force_func_i(pos)[a]
+                
                 for b in range(3):
-                    hessian_force_i_ab = func.grad(lambda x: grad_force_i_a[x[b]])(pos_i)
-                f_double_prime[i, a, b] = hessian_force_i_ab
+                    for c in range(3):
+                        pos_i = positions[i].detach().clone()
+                        
+                        def grad_force_i_abc(x):
+                            pos = pos_i.clone()
+                            pos[b] = x
+                            result = func.grad(force_func_i_a)(pos)[c]
+                            return result
+                        
+                        f_double_prime[i, a, b, c] = func.grad(grad_force_i_abc)(pos_i[b].item())
 
         return forces, f_prime, f_double_prime
 
