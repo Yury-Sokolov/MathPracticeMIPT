@@ -108,10 +108,12 @@ class ModifiedYukawaPotential(torch.nn.Module):
             return func.jacfwd(func.jacrev(func.grad(potential_energy)))(pos)
         
         f_double_prime = compute_third_derivatives(positions)
-        f_double_prime = f_double_prime.reshape(N, 3, N, 3, N, 3).permute(0, 2, 4, 1, 3, 5)
-        f_double_prime = f_double_prime.reshape(N, 3, 3, 3)
+        f_double_prime = f_double_prime.reshape(N, 3, N, 3, N, 3)
+        f_double_prime_diag = torch.zeros((N, 3, 3, 3), device=self.device)
+        for i in range(N):
+            f_double_prime_diag[i] = f_double_prime[i, :, i, :, i, :]
         
-        return forces, f_prime, f_double_prime
+        return forces, f_prime, f_double_prime_diag
 
     def compute_derivatives(self, positions):
         """
