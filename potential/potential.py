@@ -104,14 +104,16 @@ class ModifiedYukawaPotential(torch.nn.Module):
         hessian = func.hessian(potential_energy)(positions)
         f_prime = hessian.reshape(N, 3, N, 3).permute(0, 2, 1, 3)
         
-        def compute_third_derivatives(pos):
-            return func.jacfwd(func.jacrev(func.grad(potential_energy)))(pos)
-        
-        f_double_prime = compute_third_derivatives(positions)
-        f_double_prime = f_double_prime.reshape(N, 3, N, 3, N, 3)
         f_double_prime_diag = torch.zeros((N, 3, 3, 3), device=self.device)
+        
         for i in range(N):
-            f_double_prime_diag[i] = f_double_prime[i, :, i, :, i, :]
+            def single_particle_potential(pos_i):
+                pos_copy = positions.clone().detach()
+                pos_copy[i] = pos_i
+                return potential_energy(pos_copy)
+            
+            third_derivatives = func.jacfwd(func.jacrev(func.grad(single_particle_potential)))(positions[i])
+            f_double_prime_diag[i] = third_derivatives
         
         return forces, f_prime, f_double_prime_diag
 
