@@ -79,7 +79,7 @@ class ModifiedYukawaPotential(torch.nn.Module):
                             result = func.grad(force_func_i_a)(pos)[c]
                             return result
                         
-                        pos_b_tensor = torch.tensor(pos_i[b].item(), device=self.device, requires_grad=True)
+                        pos_b_tensor = pos_i[b].detach().clone().requires_grad_(True)
                         f_double_prime[i, a, b, c] = func.grad(grad_force_i_abc)(pos_b_tensor)
 
         return forces, f_prime, f_double_prime
