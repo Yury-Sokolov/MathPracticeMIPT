@@ -80,75 +80,73 @@ class Simulation:
         """
         positions = self.nucleons['positions']
         masses = self.nucleons['masses']
-        N = positions.shape[0]
-        
+
         r_ij = positions.unsqueeze(1) - positions.unsqueeze(0)  # [N, N, 3]
         r = torch.norm(r_ij, dim=2)  # [N, N]
         
-        v_ij = velocities.unsqueeze(1) - velocities.unsqueeze(0)  # [N, N, 3]
-        v = torch.norm(v_ij, dim=2)  # [N, N]
-        
-        dot_rv = torch.sum(r_ij * v_ij, dim=2)  # [N, N]
-        
         mask = (r > 1e-10) & (r < self.potential.r_cutoff)
-        
-        m_i = masses.unsqueeze(1)
-        m_j = masses.unsqueeze(0)
-        mu = (m_i * m_j) / (m_i + m_j)
-        
-        nonzero_r = r.unsqueeze(-1).expand_as(r_ij)
-        nonzero_r = torch.where(nonzero_r > 1e-10, nonzero_r, torch.ones_like(nonzero_r))
-        directions = r_ij / nonzero_r
-        
-        f_diff = f.unsqueeze(1) - f.unsqueeze(0)  # [N, N, 3]
-        f_ij = torch.norm(f_diff, dim=2)  # [N, N]
-        
-        f_prime_r_ij = torch.zeros((N, N), device=self.device)
-        f_double_prime_r_ij = torch.zeros((N, N), device=self.device)
-        S = torch.zeros_like(r)
         
         valid_pairs = torch.triu(mask, diagonal=1)
         i_indices, j_indices = torch.where(valid_pairs)
         
-        if len(i_indices) > 0:
-            for idx in range(len(i_indices)):
-                i, j = i_indices[idx], j_indices[idx]
-                direction = directions[i, j]
-                
-                f_prime_r_ij_val = torch.tensor(0.0, device=self.device)
-                f_double_prime_r_ij_val = torch.tensor(0.0, device=self.device)
-                
-                for a in range(3):
-                    for b in range(3):
-                        f_prime_r_ij_val += f_prime[i, j, a, b] * direction[a] * direction[b]
-                        
-                        for c in range(3):
-                            f_double_prime_r_ij_val += f_double_prime[i, a, b, c] * direction[a] * direction[b] * direction[c]
-                
-                f_prime_r_ij[i, j] = f_prime_r_ij_val
-                f_prime_r_ij[j, i] = f_prime_r_ij_val
-                f_double_prime_r_ij[i, j] = f_double_prime_r_ij_val
-                f_double_prime_r_ij[j, i] = f_double_prime_r_ij_val
-                
-                term1_ij = (dot_rv[i, j]**3 / r[i, j]**5) * (
-                    r[i, j] * f_prime_r_ij[i, j] - f_ij[i, j] - (r[i, j]**2 * f_double_prime_r_ij[i, j]) / 3
-                )
-                
-                term2_ij = (dot_rv[i, j] / (mu[i, j] * r[i, j]**3)) * (
-                    mu[i, j] * v[i, j]**2 * (f_ij[i, j] - r[i, j] * f_prime_r_ij[i, j]) - 
-                    r[i, j]**2 * f_ij[i, j] * f_prime_r_ij[i, j]
-                )
-                
-                S[i, j] = term1_ij + term2_ij
-                S[j, i] = S[i, j]
+        if len(i_indices) == 0:
+            return self.tau_max
         
-        tau_ij = torch.ones_like(r) * self.tau_max
+        v_ij = velocities[i_indices] - velocities[j_indices]  # [pairs, 3]
+        v = torch.norm(v_ij, dim=1)  # [pairs]
         
-        nonzero_S = (torch.abs(S) > 1e-10) & mask
+        dot_rv = torch.sum(r_ij[i_indices, j_indices] * v_ij, dim=1)  # [pairs]
+        
+        m_i = masses[i_indices]
+        m_j = masses[j_indices]
+        mu = (m_i * m_j) / (m_i + m_j)  # [pairs]
+        
+        r_pairs = r[i_indices, j_indices]  # [pairs]
+        directions = r_ij[i_indices, j_indices] / r_pairs.unsqueeze(-1)  # [pairs, 3]
+        
+        f_diff = f[i_indices] - f[j_indices]  # [pairs, 3]
+        f_ij = torch.norm(f_diff, dim=1)  # [pairs]
+        
+        f_prime_r_ij = torch.zeros(len(i_indices), device=self.device)
+        f_double_prime_r_ij = torch.zeros(len(i_indices), device=self.device)
+        S = torch.zeros(len(i_indices), device=self.device)
+        
+        for idx in range(len(i_indices)):
+            i, j = i_indices[idx], j_indices[idx]
+            direction = directions[idx]
+            
+            f_prime_r_ij_val = torch.tensor(0.0, device=self.device)
+            f_double_prime_r_ij_val = torch.tensor(0.0, device=self.device)
+            
+            for a in range(3):
+                for b in range(3):
+                    f_prime_r_ij_val += f_prime[i, j, a, b] * direction[a] * direction[b]
+                    
+                    for c in range(3):
+                        f_double_prime_r_ij_val += f_double_prime[i, a, b, c] * direction[a] * direction[b] * direction[c]
+            
+            f_prime_r_ij[idx] = f_prime_r_ij_val
+            f_double_prime_r_ij[idx] = f_double_prime_r_ij_val
+            
+            term1 = (dot_rv[idx]**3 / r_pairs[idx]**5) * (
+                r_pairs[idx] * f_prime_r_ij[idx] - f_ij[idx] - (r_pairs[idx]**2 * f_double_prime_r_ij[idx]) / 3
+            )
+            
+            term2 = (dot_rv[idx] / (mu[idx] * r_pairs[idx]**3)) * (
+                mu[idx] * v[idx]**2 * (f_ij[idx] - r_pairs[idx] * f_prime_r_ij[idx]) - 
+                r_pairs[idx]**2 * f_ij[idx] * f_prime_r_ij[idx]
+            )
+            
+            S[idx] = term1 + term2
+        
+        # Вычисляем tau только для взаимодействующих пар
+        tau_ij = torch.ones_like(S) * self.tau_max
+        
+        nonzero_S = torch.abs(S) > 1e-10
         if torch.any(nonzero_S):
             tau_ij[nonzero_S] = 2 * torch.sqrt(self.Imax / torch.abs(S[nonzero_S]))
         
-        min_tau = torch.min(tau_ij + torch.eye(N, device=self.device) * self.tau_max)
+        min_tau = torch.min(tau_ij)
         
         dt = torch.clamp(min_tau, self.dt_min, self.tau_max)
         
