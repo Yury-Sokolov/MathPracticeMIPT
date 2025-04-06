@@ -8,7 +8,7 @@ from .cluster import  Cluster
 
 class Simulation:
     def __init__(self, potential, t_end, device='cuda', Imax=0.1, tau_max=0.01,
-                 dt_min=1e-10, adaptive_dt=True):
+                 dt_min=1e-10, adaptive_dt=True, clustering_algorithm=None):
         self.potential = potential
         self.Imax = Imax
         self.tau_max = tau_max
@@ -17,6 +17,7 @@ class Simulation:
         self.device = device
         self.eta = 0.1
         self.adaptive_dt = adaptive_dt
+        self.clustering_algorithm = clustering_algorithm
         self.clusters = []
         self.nucleons = {
             'positions': None,
@@ -236,16 +237,27 @@ class Simulation:
         final_positions = torch.tensor(self.trajectories[-1], device=self.device)
         final_velocities = torch.tensor(self.velocities_history[-1], device=self.device)
         masses = self.nucleons['masses']
-        cluster_ids = self.nucleons['cluster_ids']
+        
+        if self.clustering_algorithm is not None:
+            positions_np = final_positions.cpu().numpy()
+            
+            cluster_labels = self.clustering_algorithm.fit_predict(positions_np)
+            
+            cluster_ids = torch.tensor(cluster_labels, device=self.device)
+        else:
+            cluster_ids = self.nucleons['cluster_ids']
         
         unique_cluster_ids = torch.unique(cluster_ids)
-
+        if -1 in unique_cluster_ids:
+            unique_cluster_ids = unique_cluster_ids[unique_cluster_ids != -1]
+        
         cluster_data = {
             'positions': [],
             'velocities': [],
             'masses': [],
             'sizes': [],
-            'nucleon_indices': []
+            'nucleon_indices': [],
+            'cluster_labels': cluster_ids.cpu().numpy()
         }
         
         for cluster_id in unique_cluster_ids:
@@ -254,21 +266,21 @@ class Simulation:
             cluster_velocities = final_velocities[mask]
             cluster_masses = masses[mask]
             
-            total_mass = torch.sum(cluster_masses)
-            com_position = torch.sum(cluster_nucleons * cluster_masses.unsqueeze(1), dim=0) / total_mass
-            com_velocity = torch.sum(cluster_velocities * cluster_masses.unsqueeze(1), dim=0) / total_mass
-            
-            cluster_data['positions'].append(com_position.cpu().numpy())
-            cluster_data['velocities'].append(com_velocity.cpu().numpy())
-            cluster_data['masses'].append(total_mass.cpu().numpy())
-            cluster_data['sizes'].append(torch.sum(mask).cpu().numpy())
-            cluster_data['nucleon_indices'].append(torch.where(mask)[0].cpu().numpy())
+            if torch.sum(mask) > 0:
+                total_mass = torch.sum(cluster_masses)
+                com_position = torch.sum(cluster_nucleons * cluster_masses.unsqueeze(1), dim=0) / total_mass
+                com_velocity = torch.sum(cluster_velocities * cluster_masses.unsqueeze(1), dim=0) / total_mass
+                
+                cluster_data['positions'].append(com_position.cpu().numpy())
+                cluster_data['velocities'].append(com_velocity.cpu().numpy())
+                cluster_data['masses'].append(total_mass.cpu().numpy())
+                cluster_data['sizes'].append(torch.sum(mask).cpu().numpy())
+                cluster_data['nucleon_indices'].append(torch.where(mask)[0].cpu().numpy())
         
         for key in ['positions', 'velocities', 'masses', 'sizes']:
             cluster_data[key] = np.array(cluster_data[key])
             
         return cluster_data
-        
 
     @staticmethod
     def analyze_multiple_results(results):
@@ -404,8 +416,8 @@ class Simulation:
         """
         Сброс состояния симуляции для повторного использования
         
-        Сохраняет настройки и потенциал, но очищает данные о траекториях, 
-        кластерах и нуклонах
+        Сохраняет настройки, потенциал и алгоритм кластеризации, 
+        но очищает данные о траекториях, кластерах и нуклонах
         """
         self.clusters = []
         self.nucleons = {

@@ -63,7 +63,6 @@ class MesonExchangePotential(torch.nn.Module):
         Returns:
             torch.Tensor: Силы, действующие на частицы [N, 3]
         """
-        # Определяем функцию потенциальной энергии системы
         def potential_energy(pos):
             r_ij = pos.unsqueeze(1) - pos.unsqueeze(0)
             distances = torch.norm(r_ij, dim=2)
@@ -79,7 +78,6 @@ class MesonExchangePotential(torch.nn.Module):
 
             return torch.sum(torch.triu(pair_potential, diagonal=1))
             
-        # Вычисляем силы как отрицательный градиент потенциальной энергии
         forces = -func.grad(potential_energy)(positions)
         
         return forces
