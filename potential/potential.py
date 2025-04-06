@@ -20,6 +20,7 @@ class MesonExchangePotential(torch.nn.Module):
 
         self._compute_compiled = torch.compile(self.compute)
         self._compute_derivatives_compiled = torch.compile(self._compute_derivatives_impl)
+        self._compute_force_only_compiled = torch.compile(self._compute_force_only_impl)
 
     def compute(self, r):
         r_safe = torch.clamp(r, min=1e-10)
@@ -39,6 +40,49 @@ class MesonExchangePotential(torch.nn.Module):
         potential = self.compute(r_tensor)
         force = -torch.autograd.grad(potential.sum(), r_tensor, create_graph=True)[0]
         return force
+
+    def compute_force_only(self, positions):
+        """
+        Вычисление только сил без производных
+        
+        Args:
+            positions: Позиции частиц [N, 3]
+            
+        Returns:
+            torch.Tensor: Силы, действующие на частицы [N, 3]
+        """
+        return self._compute_force_only_compiled(positions)
+
+    def _compute_force_only_impl(self, positions):
+        """
+        Вычисление только сил без производных, используя автоматическое дифференцирование
+        
+        Args:
+            positions: Позиции частиц [N, 3]
+            
+        Returns:
+            torch.Tensor: Силы, действующие на частицы [N, 3]
+        """
+        # Определяем функцию потенциальной энергии системы
+        def potential_energy(pos):
+            r_ij = pos.unsqueeze(1) - pos.unsqueeze(0)
+            distances = torch.norm(r_ij, dim=2)
+            r_safe = torch.clamp(distances, min=1e-10)
+
+            yukawa = -self.g_att_sq * torch.exp(-self.m_pi * r_safe) / r_safe
+            repulsion = self.g_rep_sq * torch.exp(-self.m_rho * r_safe) / r_safe
+
+            pair_potential = torch.where(
+                (r_safe > self.r_core) & (r_safe < self.r_cutoff),
+                yukawa + repulsion,
+                torch.zeros_like(distances))
+
+            return torch.sum(torch.triu(pair_potential, diagonal=1))
+            
+        # Вычисляем силы как отрицательный градиент потенциальной энергии
+        forces = -func.grad(potential_energy)(positions)
+        
+        return forces
 
     def _compute_derivatives_impl(self, positions):
         N = positions.shape[0]

@@ -160,4 +160,26 @@ class Cluster:
     @property
     def masses(self):
         return self.nucleons['masses']
+
+    def translate(self, offset):
+        """Перемещение всех нуклонов на заданный вектор"""
+        self.nucleons['positions'] += offset
+        
+    def clone(self):
+        """Создает глубокую копию кластера
+        
+        Returns:
+            Cluster: Новый кластер с теми же параметрами
+        """
+        new_nucleons = {
+            'positions': self.nucleons['positions'].clone(),
+            'velocities': self.nucleons['velocities'].clone(),
+            'masses': self.nucleons['masses'].clone()
+        }
+        
+        return Cluster(
+            nucleons=new_nucleons,
+            device=self.device,
+            dtype=self.dtype
+        )
             

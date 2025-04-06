@@ -1,44 +1,81 @@
 import torch
+import matplotlib.pyplot as plt
 from sklearn.cluster import DBSCAN
+import os
 
-from core import Cluster, Simulation
+from core import Simulation
 from potential import MesonExchangePotential
 
 if __name__ == "__main__":
+    os.makedirs("plots", exist_ok=True)
+    
     torch.backends.cudnn.benchmark = True
-    device = torch.device('cuda')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Используется устройство: {device}")
+    
     potential = MesonExchangePotential(
-        g_att= 13.5,
-        g_rep= 20.0,
-        m_pi= 0.70,
+        g_att=13.5,
+        g_rep=20.0,
+        m_pi=0.70,
         m_rho=3.93,
-        r_cutoff= 5.0,
+        r_cutoff=5.0,
         r_core=0.3,
-        device= 'cuda'
+        device=device
     )
-    sim = Simulation(potential, dt_min=1e-16, t_end=1., device=device)
-
-    cluster1 = Cluster(position=torch.tensor([-4.5, 0.0, 0.0]),
-                       velocity=torch.tensor([10., 0., 0.]),
-                       random_velocity=3,
-                       radius=1,
-                       N=20)
-
-    cluster2 = Cluster(position=torch.tensor([4.5, 0.0, 0.0]),
-                       velocity=torch.tensor([-10., 0., 0.]),
-                       random_velocity=3,
-                       radius=1,
-                       N=20)
-
-    sim.add_cluster(cluster1)
-    sim.add_cluster(cluster2)
-
-
-    sim.run(save_interval=1, dt_initial=0.00001, max_steps=2)
-
-
-
-    sim.create_animation(filename="plots/result.mp4", fps=30, limit=10)
-
+    
+    sim = Simulation(
+        potential, 
+        t_end=1.0, 
+        device=device, 
+        dt_min=1e-16,
+        tau_max=0.01,
+        Imax=0.1
+    )
+    #
+    # print("Запуск одиночной демонстрационной симуляции...")
+    # sim.setup_impact_parameter(
+    #     nucleus_count1=20,
+    #     nucleus_count2=20,
+    #     impact_parameter=1.0,
+    #     relative_velocity=20.0,
+    #     random_velocity=3.0,
+    #     radius1=1.0,
+    #     radius2=1.0
+    # )
+    #
+    # result = sim.run(save_interval=5, dt_initial=0.00001, max_steps=1000)
+    #
+    print("Создание анимации столкновения...")
+    sim.create_animation(filename="plots/demo_collision.mp4", fps=30, limit=10)
+    
+    print("Анализ результатов с помощью DBSCAN...")
     clustering = DBSCAN(eps=1.5, min_samples=3)
-    sim.cluster_analysis(clustering, save_path="plots/result.png",  limit=10)
+    sim.cluster_analysis(clustering, save_path="plots/demo_clusters.png", limit=10)
+    
+    print("\nЗапуск множественных столкновений для статистического анализа...")
+    
+    NUM_COLLISIONS = 10000
+    
+    results = sim.run_multiple_collisions(
+        count=NUM_COLLISIONS,
+        nucleus_count1=20,
+        nucleus_count2=20,
+        velocity=20.0,
+        max_impact_parameter=5.0,
+        save_interval=10,
+        dt_initial=0.00001,
+        max_steps=500,
+        random_velocity=3.0,
+        radius1=1.0,
+        radius2=1.0
+    )
+    
+    print("Анализ результатов множественных столкновений...")
+    stats = Simulation.analyze_multiple_results(results)
+    
+    if stats is not None and 'figure' in stats:
+        stats['figure'].savefig("plots/statistics.png", dpi=300)
+        plt.close(stats['figure'])
+        print("Статистика сохранена в plots/statistics.png")
+    
+    print("Эксперимент завершен!")
