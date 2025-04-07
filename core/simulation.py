@@ -193,29 +193,29 @@ class Simulation:
         forces, f_prime, f_double_prime = self.compute_forces(positions)
         a_prev = forces
 
-        with tqdm(total=max_steps) as pb:
-            while t < self.t_end and step_count < max_steps:
-                positions, velocities, a_new, f_prime, f_double_prime = self._update_positions_velocities(
-                    positions, velocities, a_prev, dt
-                )
-                
-                if self.adaptive_dt:
-                    dt = self.compute_adaptive_dt(velocities, a_new, f_prime, f_double_prime)
+        # with tqdm(total=max_steps) as pb:
+        while t < self.t_end and step_count < max_steps:
+            positions, velocities, a_new, f_prime, f_double_prime = self._update_positions_velocities(
+                positions, velocities, a_prev, dt
+            )
 
-                t += dt
-                step_count += 1
+            if self.adaptive_dt:
+                dt = self.compute_adaptive_dt(velocities, a_new, f_prime, f_double_prime)
 
-                if step_count % save_interval == 0:
-                    self.times.append(t)
-                    self.trajectories.append(positions.cpu().detach().numpy())
-                    self.velocities_history.append(velocities.cpu().detach().numpy())
+            t += dt
+            step_count += 1
 
-                    pb.update(save_interval)
-                    pb.set_description(
-                        f"t={t:.3f}, dt={dt:.3e}, progress={100 * t / self.t_end:.1f}%"
-                    )
+            if step_count % save_interval == 0:
+                self.times.append(t)
+                self.trajectories.append(positions.cpu().detach().numpy())
+                self.velocities_history.append(velocities.cpu().detach().numpy())
 
-                a_prev = a_new
+                # pb.update(save_interval)
+                # pb.set_description(
+                #     f"t={t:.3f}, dt={dt:.3e}, progress={100 * t / self.t_end:.1f}%"
+                # )
+
+            a_prev = a_new
 
         self.nucleons['positions'] = positions
         self.nucleons['velocities'] = velocities
