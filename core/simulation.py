@@ -220,7 +220,7 @@ class Simulation:
         self.nucleons['positions'] = positions
         self.nucleons['velocities'] = velocities
 
-        print(f"Simulation completed at t={t:.3f}")
+        # print(f"Simulation completed at t={t:.3f}")
         return self.get_cluster_data()
 
     def get_cluster_data(self):
