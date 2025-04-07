@@ -76,9 +76,17 @@ class Simulation:
     def compute_forces(self, positions):
         if self.adaptive_dt:
             forces, f_prime, f_double_prime = self.potential.compute_derivatives(positions)
+            # Проверка на очень малые силы - добавляем небольшую случайную силу, чтобы избежать застоя
+            if torch.all(torch.abs(forces) < 1e-10):
+                small_random_force = torch.randn_like(forces) * 1e-8
+                forces = forces + small_random_force
             return forces / self.nucleons['masses'].unsqueeze(1), f_prime, f_double_prime
         else:
             forces = self.potential.compute_force_only(positions)
+            # Проверка на очень малые силы - добавляем небольшую случайную силу, чтобы избежать застоя
+            if torch.all(torch.abs(forces) < 1e-10):
+                small_random_force = torch.randn_like(forces) * 1e-8
+                forces = forces + small_random_force
             return forces / self.nucleons['masses'].unsqueeze(1), None, None
 
     def _compute_adaptive_dt_impl(self, velocities, f, f_prime, f_double_prime):
@@ -559,8 +567,14 @@ class Simulation:
         
         device = self.device
         
+        # Убедимся, что относительная скорость достаточно велика
+        relative_velocity = max(relative_velocity, 5.0)
+        
+        # Увеличим расстояние между кластерами, чтобы у них было время для разгона
+        separation = max(radius1 + radius2, 4.0)
+        
         cluster1 = Cluster(
-            position=torch.tensor([-radius1 - 2.0, 0.0, 0.0], device=device),
+            position=torch.tensor([-separation, 0.0, 0.0], device=device),
             velocity=torch.tensor([0.0, 0.0, 0.0], device=device),
             radius=radius1,
             random_velocity=random_velocity,
@@ -569,7 +583,7 @@ class Simulation:
         )
         
         cluster2 = Cluster(
-            position=torch.tensor([radius2 + 2.0, impact_parameter, 0.0], device=device),
+            position=torch.tensor([separation, impact_parameter, 0.0], device=device),
             velocity=torch.tensor([0.0, 0.0, 0.0], device=device),
             radius=radius2,
             N=nucleus_count2,
@@ -580,15 +594,16 @@ class Simulation:
         if random_velocity > 0:
             cluster1.add_random_velocity(random_velocity)
             cluster2.add_random_velocity(random_velocity)
-            
-            cluster1.add_random_rotation(0.1)
-            cluster2.add_random_rotation(0.1)
         
         m1 = torch.sum(cluster1.masses)
         m2 = torch.sum(cluster2.masses)
         
         v1 = -relative_velocity * (m2 / (m1 + m2))
         v2 = relative_velocity * (m1 / (m1 + m2))
+        
+        # Убедимся, что скорости не слишком малы
+        v1 = -relative_velocity/2 if abs(v1) < 1.0 else v1
+        v2 = relative_velocity/2 if abs(v2) < 1.0 else v2
         
         vel1 = torch.zeros(3, device=device)
         vel1[0] = v1
