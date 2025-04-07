@@ -555,7 +555,7 @@ class Simulation:
             nucleus_count1: Количество нуклонов в первом кластере
             nucleus_count2: Количество нуклонов во втором кластере
             impact_parameter: Прицельный параметр (расстояние между центрами масс в плоскости xy)
-            relative_velocity: Относительная скорость кластеров вдоль оси x
+            relative_velocity: Относительная скорость кластеров
             random_velocity: Величина случайной скорости для нуклонов в кластерах
             radius1: Радиус первого кластера
             radius2: Радиус второго кластера
@@ -567,14 +567,19 @@ class Simulation:
         
         device = self.device
         
-        # Убедимся, что относительная скорость достаточно велика
         relative_velocity = max(relative_velocity, 5.0)
         
-        # Увеличим расстояние между кластерами, чтобы у них было время для разгона
         separation = max(radius1 + radius2, 4.0)
         
+
+        collision_point = torch.tensor([0.0, impact_parameter/2.0, 0.0], device=device)
+        
+
+        pos1 = torch.tensor([-separation, 0.0, 0.0], device=device)
+        pos2 = torch.tensor([separation, impact_parameter, 0.0], device=device)
+        
         cluster1 = Cluster(
-            position=torch.tensor([-separation, 0.0, 0.0], device=device),
+            position=pos1,
             velocity=torch.tensor([0.0, 0.0, 0.0], device=device),
             radius=radius1,
             random_velocity=random_velocity,
@@ -583,7 +588,7 @@ class Simulation:
         )
         
         cluster2 = Cluster(
-            position=torch.tensor([separation, impact_parameter, 0.0], device=device),
+            position=pos2,
             velocity=torch.tensor([0.0, 0.0, 0.0], device=device),
             radius=radius2,
             N=nucleus_count2,
@@ -597,19 +602,29 @@ class Simulation:
         
         m1 = torch.sum(cluster1.masses)
         m2 = torch.sum(cluster2.masses)
+        total_mass = m1 + m2
         
-        v1 = -relative_velocity * (m2 / (m1 + m2))
-        v2 = relative_velocity * (m1 / (m1 + m2))
+        dir1 = collision_point - pos1
+        dir2 = collision_point - pos2
         
-        # Убедимся, что скорости не слишком малы
-        v1 = -relative_velocity/2 if abs(v1) < 1.0 else v1
-        v2 = relative_velocity/2 if abs(v2) < 1.0 else v2
+
+        dir1_norm = torch.norm(dir1)
+        dir2_norm = torch.norm(dir2)
         
-        vel1 = torch.zeros(3, device=device)
-        vel1[0] = v1
-        vel2 = torch.zeros(3, device=device)
-        vel2[0] = v2
+        if dir1_norm > 0:
+            dir1 = dir1 / dir1_norm
         
+        if dir2_norm > 0:
+            dir2 = dir2 / dir2_norm
+        
+        v1_mag = relative_velocity * (m2 / total_mass)
+        v2_mag = relative_velocity * (m1 / total_mass)
+        
+
+        vel1 = dir1 * v1_mag
+        vel2 = dir2 * v2_mag
+        
+
         cluster1.add_velocity(vel1)
         cluster2.add_velocity(vel2)
         
