@@ -3,13 +3,16 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
 import torch
-from .cluster import  Cluster
+import torch.nn as nn
+from .cluster import Cluster
 
 
 class Simulation:
     def __init__(self, potential, t_end, device='cuda', Imax=0.1, tau_max=0.01,
-                 dt_min=1e-10, adaptive_dt=True, clustering_algorithm=None):
+                 dt_min=1e-10, adaptive_dt=True, clustering_algorithm=None,
+                 neural_network: nn.Module | None = None):
         self.potential = potential
+        self.neural_network = neural_network
         self.Imax = Imax
         self.tau_max = tau_max
         self.dt_min = dt_min
@@ -30,8 +33,32 @@ class Simulation:
         self.trajectories = []
         self.velocities_history = []
         
-        self._compute_adaptive_dt_compiled = torch.compile(self._compute_adaptive_dt_impl)
-        self._update_positions_velocities = torch.compile(self._update_positions_velocities_impl)
+        can_compile = True
+        if self.neural_network is not None:
+            can_compile = False
+
+        if can_compile:
+            try:
+                if self.adaptive_dt:
+                    if not hasattr(self.potential, 'compute_scalar_derivatives'):
+                        print("Warning: Adaptive timestep requires potential.compute_scalar_derivatives. Disabling.")
+                        self.adaptive_dt = False
+                        self._compute_adaptive_dt_compiled = self._compute_adaptive_dt_impl
+                    else:
+                        self._compute_adaptive_dt_compiled = torch.compile(self._compute_adaptive_dt_impl)
+                else:
+                    self._compute_adaptive_dt_compiled = self._compute_adaptive_dt_impl
+
+                self._update_positions_velocities = torch.compile(self._update_positions_velocities_impl)
+                print("Simulation steps successfully compiled.")
+            except Exception as e:
+                print(f"Warning: torch.compile failed ({e}). Falling back to eager execution.")
+                self._compute_adaptive_dt_compiled = self._compute_adaptive_dt_impl
+                self._update_positions_velocities = self._update_positions_velocities_impl
+        else:
+            print("Note: torch.compile skipped (using NN or disabled).")
+            self._compute_adaptive_dt_compiled = self._compute_adaptive_dt_impl
+            self._update_positions_velocities = self._update_positions_velocities_impl
 
     def add_cluster(self, cluster):
         """
@@ -73,21 +100,48 @@ class Simulation:
                 cluster_ids
             ], dim=0)
 
+    def _compute_nn_forces(self, positions):
+        n_particles = positions.shape[0]
+        total_forces = torch.zeros_like(positions)
+
+        indices_i, indices_j = torch.triu_indices(n_particles, n_particles, offset=1)
+        indices_i = indices_i.to(self.device)
+        indices_j = indices_j.to(self.device)
+
+        if len(indices_i) == 0:
+            return total_forces, None, None
+
+        pos_i = positions[indices_i]
+        pos_j = positions[indices_j]
+        relative_pos_ij = pos_i - pos_j
+        relative_pos_ji = -relative_pos_ij
+
+        force_ij_pred = self.neural_network(relative_pos_ij)
+        force_ji_pred = self.neural_network(relative_pos_ji)
+
+        force_ij_sym = 0.5 * (force_ij_pred - force_ji_pred)
+
+        total_forces.index_add_(0, indices_i, force_ij_sym)
+        total_forces.index_add_(0, indices_j, -force_ij_sym)
+
+        return total_forces, None, None
+
     def compute_forces(self, positions):
-        if self.adaptive_dt:
-            forces, f_prime, f_double_prime = self.potential.compute_derivatives(positions)
-            # Проверка на очень малые силы - добавляем небольшую случайную силу, чтобы избежать застоя
-            if torch.all(torch.abs(forces) < 1e-10):
-                small_random_force = torch.randn_like(forces) * 1e-8
-                forces = forces + small_random_force
-            return forces / self.nucleons['masses'].unsqueeze(1), f_prime, f_double_prime
+        f_prime, f_double_prime = None, None
+
+        if self.neural_network is not None:
+            forces, _, _ = self._compute_nn_forces(positions)
+        elif self.potential is not None:
+            if self.adaptive_dt:
+                forces, f_prime, f_double_prime = self.potential.compute_derivatives(positions)
+            else:
+                forces = self.potential.compute_force_only(positions)
         else:
-            forces = self.potential.compute_force_only(positions)
-            # Проверка на очень малые силы - добавляем небольшую случайную силу, чтобы избежать застоя
-            if torch.all(torch.abs(forces) < 1e-10):
-                small_random_force = torch.randn_like(forces) * 1e-8
-                forces = forces + small_random_force
-            return forces / self.nucleons['masses'].unsqueeze(1), None, None
+            raise ValueError("No force calculation method available (potential or NN).")
+
+        acceleration = forces / self.nucleons['masses'].unsqueeze(1)
+
+        return acceleration, f_prime, f_double_prime
 
     def _compute_adaptive_dt_impl(self, velocities, f, f_prime, f_double_prime):
         """
@@ -228,8 +282,19 @@ class Simulation:
         self.nucleons['positions'] = positions
         self.nucleons['velocities'] = velocities
 
-        # print(f"Simulation completed at t={t:.3f}")
-        return self.get_cluster_data()
+
+        run_times = torch.tensor(self.times, dtype=torch.float32).detach()
+        run_positions = torch.from_numpy(np.array(self.trajectories)).float().detach()
+        run_velocities = torch.from_numpy(np.array(self.velocities_history)).float().detach()
+        run_masses = self.nucleons['masses'].cpu().detach()
+        
+        results = {
+            'times': run_times,
+            'positions': run_positions,
+            'velocities': run_velocities,
+            'masses': run_masses
+        }
+        return results
 
     def get_cluster_data(self):
         """
