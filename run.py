@@ -315,8 +315,8 @@ def train_ude(args):
                     if epoch < args.epochs // 4:
                         current_sym_weight *= 0.1
                     
-                    mse_loss_clamped = torch.clamp(mse_loss_step, max=10.0)
-                    symmetry_loss_clamped = torch.clamp(symmetry_loss, max=10.0) if isinstance(symmetry_loss, torch.Tensor) else symmetry_loss
+                    mse_loss_clamped = mse_loss_step
+                    symmetry_loss_clamped = symmetry_loss
                     
                     loss_scale = 1.0
                     if epoch < 5 and mse_loss_step > 1.0:
