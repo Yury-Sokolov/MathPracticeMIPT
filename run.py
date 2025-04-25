@@ -225,7 +225,6 @@ def train_ude(args):
     output_dir = os.path.dirname(args.model_save_path)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Initialize wandb if enabled
     if args.use_wandb:
         wandb_config = {
             'phase': 'training',
@@ -260,7 +259,6 @@ def train_ude(args):
     print(f"Loading training data from {args.data_file}...")
     data = torch.load(args.data_file, map_location='cpu')
     
-    # Log data file info to wandb
     if args.use_wandb:
         wandb.config.update({
             'data_file': args.data_file,
@@ -271,7 +269,7 @@ def train_ude(args):
             'm_pi': data['potential_params']['m_pi'],
             'm_rho': data['potential_params']['m_rho'],
         })
-    
+
     times = data['times']
     masses = data['masses'].to(device)
     sim_params_loaded = data['sim_params']
@@ -332,8 +330,7 @@ def train_ude(args):
         adaptive_dt=False
     )
     sim_model.nucleons['masses'] = masses
-    
-    # Log model parameters with wandb
+    optimizer = optim.AdamW(nn_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     if args.use_wandb:
         wandb.watch(nn_model, log="all", log_freq=10)
     if args.use_scheduler:
@@ -350,7 +347,7 @@ def train_ude(args):
     
     for param_group in optimizer.param_groups:
         param_group['initial_lr'] = param_group['lr']
-        if param_group['lr'] > 1e-4 and epoch == 0:
+        if param_group['lr'] > 1e-4:
             param_group['lr'] *= 0.1
 
     losses = []
