@@ -8,6 +8,7 @@ from tqdm import tqdm
 import numpy as np
 import argparse
 import time
+import wandb
 
 try:
     from core import Simulation
@@ -25,6 +26,37 @@ def generate_data(args):
     output_dir = os.path.dirname(args.data_file)
     os.makedirs(output_dir, exist_ok=True)
 
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        wandb_config = {
+            'phase': 'data_generation',
+            'g_att': args.g_att,
+            'g_rep': args.g_rep,
+            'm_pi': args.m_pi,
+            'm_rho': args.m_rho,
+            'r_cutoff': args.r_cutoff,
+            'r_core': args.r_core,
+            't_end': args.t_end,
+            'dt_min': args.dt_min,
+            'tau_max': args.tau_max,
+            'Imax': args.Imax,
+            'n_particles': args.n_particles,
+            'relative_velocity': args.relative_velocity,
+            'random_velocity': args.random_velocity,
+            'radius': args.radius,
+            'num_collisions': args.num_collisions,
+            'max_impact_parameter': args.max_impact_parameter,
+            'noise_level': args.noise_level
+        }
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name or f"data-gen-{args.n_particles}p-{args.num_collisions}c", 
+            config=wandb_config,
+            tags=args.wandb_tags + ["data_generation"],
+            resume="allow"
+        )
+        
     device = torch.device(args.device)
     print(f"Using device: {device}")
 
@@ -62,6 +94,10 @@ def generate_data(args):
     all_masses = None
 
     random_impact_params = np.sqrt(np.random.random(args.num_collisions)) * args.max_impact_parameter
+    
+    # Log impact parameters if wandb enabled
+    if args.use_wandb:
+        wandb.log({"impact_parameters": wandb.Histogram(random_impact_params)})
 
     for b in tqdm(random_impact_params, desc="Simulating Collisions"):
         current_setup_params = setup_base_params.copy()
@@ -80,6 +116,20 @@ def generate_data(args):
 
         if all_masses is None:
             all_masses = sim.nucleons['masses'].cpu()
+            
+        # Log collision metrics if wandb enabled
+        if args.use_wandb:
+            avg_energy = sim.compute_energy().mean().item()
+            max_vel = torch.norm(vel_coll[-1], dim=-1).max().item()
+            final_spread = torch.std(pos_coll[-1], dim=0).mean().item()
+            
+            wandb.log({
+                f"collision_{len(all_times)}/impact_parameter": b,
+                f"collision_{len(all_times)}/avg_energy": avg_energy,
+                f"collision_{len(all_times)}/max_velocity": max_vel,
+                f"collision_{len(all_times)}/final_spatial_spread": final_spread,
+                f"collision_{len(all_times)}/trajectory_length": len(times_coll)
+            })
 
     try:
         stacked_positions = torch.stack(all_positions, dim=0)
@@ -108,6 +158,36 @@ def generate_data(args):
     vel_noise_std = args.noise_level * vel_mean_norm if vel_mean_norm > 0 else 1e-6
     noisy_positions_flat = true_positions_flat + torch.randn_like(true_positions_flat) * pos_noise_std
     noisy_velocities_flat = true_velocities_flat + torch.randn_like(true_velocities_flat) * vel_noise_std
+    
+    if args.use_wandb:
+        wandb.log({
+            "dataset/total_timesteps": len(times_flat),
+            "dataset/num_particles": true_positions_flat.shape[1],
+            "dataset/pos_noise_std": pos_noise_std,
+            "dataset/vel_noise_std": vel_noise_std,
+            "dataset/pos_mean_norm": pos_mean_norm.item(),
+            "dataset/vel_mean_norm": vel_mean_norm.item(),
+        })
+        
+        if true_positions_flat.shape[0] > 0 and true_positions_flat.shape[1] > 0:
+            fig = plt.figure(figsize=(10, 8))
+            sample_idx = 0  
+            sample_particles = min(5, true_positions_flat.shape[1])  
+            
+            for i in range(sample_particles):
+                plt.plot(true_positions_flat[:100, i, 0].cpu().numpy(), 
+                        true_positions_flat[:100, i, 1].cpu().numpy(), 
+                        '-', alpha=0.7, label=f'True P{i}')
+                plt.plot(noisy_positions_flat[:100, i, 0].cpu().numpy(), 
+                        noisy_positions_flat[:100, i, 1].cpu().numpy(), 
+                        '.', markersize=2, alpha=0.5, label=f'Noisy P{i}')
+            
+            plt.title("Sample Trajectory (First 100 steps)")
+            plt.xlabel("X position")
+            plt.ylabel("Y position")
+            plt.legend()
+            wandb.log({"dataset/sample_trajectory": wandb.Image(fig)})
+            plt.close(fig)
 
     data_to_save = {
         'potential_params': potential_params,
@@ -135,12 +215,41 @@ def generate_data(args):
     torch.save(data_to_save, args.data_file)
     end_time = time.time()
     print(f"--- Data Generation Finished ({end_time - start_time:.2f}s) ---")
+    
+    if args.use_wandb:
+        wandb.finish()
 
 def train_ude(args):
     print("\n--- Starting UDE Training ---")
     start_time = time.time()
     output_dir = os.path.dirname(args.model_save_path)
     os.makedirs(output_dir, exist_ok=True)
+
+    # Initialize wandb if enabled
+    if args.use_wandb:
+        wandb_config = {
+            'phase': 'training',
+            'learning_rate': args.learning_rate,
+            'epochs': args.epochs,
+            'nn_hidden_dim': args.nn_hidden_dim,
+            'batch_size': args.batch_size,
+            'use_scheduler': args.use_scheduler,
+            'weight_decay': args.weight_decay,
+            'num_residual_blocks': args.num_residual_blocks,
+            'symmetry_weight': args.symmetry_weight,
+            'clip_grad': args.clip_grad,
+            'patience': args.patience,
+            'device': args.device
+        }
+        
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name or f"train-ude-{args.nn_hidden_dim}d-{args.epochs}e", 
+            config=wandb_config,
+            tags=args.wandb_tags + ["training"],
+            resume="allow"
+        )
 
     device = torch.device(args.device)
     print(f"Using device: {device}")
@@ -150,6 +259,18 @@ def train_ude(args):
 
     print(f"Loading training data from {args.data_file}...")
     data = torch.load(args.data_file, map_location='cpu')
+    
+    # Log data file info to wandb
+    if args.use_wandb:
+        wandb.config.update({
+            'data_file': args.data_file,
+            'num_particles': data['noisy_positions'].shape[1],
+            'noise_level': data.get('noise_level', 'unknown'),
+            'g_att': data['potential_params']['g_att'],
+            'g_rep': data['potential_params']['g_rep'],
+            'm_pi': data['potential_params']['m_pi'],
+            'm_rho': data['potential_params']['m_rho'],
+        })
     
     times = data['times']
     masses = data['masses'].to(device)
@@ -211,9 +332,10 @@ def train_ude(args):
         adaptive_dt=False
     )
     sim_model.nucleons['masses'] = masses
-
-    optimizer = optim.AdamW(nn_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
+    # Log model parameters with wandb
+    if args.use_wandb:
+        wandb.watch(nn_model, log="all", log_freq=10)
     if args.use_scheduler:
         print(f"Using CosineAnnealingLR scheduler with warmup")
         warmup_epochs = max(1, int(args.epochs * 0.1))
@@ -452,6 +574,23 @@ def analyze_results(args):
     plot_trajectory_path = os.path.join(output_dir, "ude_trajectory_comparison.png")
     plot_force_path = os.path.join(output_dir, "ude_force_comparison.png")
 
+    if args.use_wandb:
+        wandb_config = {
+            'phase': 'analysis',
+            'model_load_path': args.model_load_path,
+            'nn_hidden_dim': args.nn_hidden_dim,
+            'device': args.device
+        }
+        
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name or f"analyze-ude-{os.path.basename(args.model_load_path)}", 
+            config=wandb_config,
+            tags=args.wandb_tags + ["analysis"],
+            resume="allow"
+        )
+
     device = torch.device(args.device)
     print(f"Using device: {device}")
 
@@ -521,6 +660,16 @@ def analyze_results(args):
     )
     ude_predicted_positions = ude_predicted_positions.detach().cpu()
     print("Prediction complete.")
+    
+    true_positions_first = true_positions[:num_steps_per_traj]
+    trajectory_mse = torch.mean((ude_predicted_positions - true_positions_first.cpu())**2).item()
+    trajectory_rmse = trajectory_mse**0.5
+    
+    if args.use_wandb:
+        wandb.log({
+            "prediction/trajectory_mse": trajectory_mse,
+            "prediction/trajectory_rmse": trajectory_rmse,
+        })
 
     print(f"Plotting trajectory comparison (first collision) to {plot_trajectory_path}...")
     true_positions_first = true_positions[:num_steps_per_traj]
@@ -546,6 +695,10 @@ def analyze_results(args):
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(plot_trajectory_path)
+    
+    if args.use_wandb:
+        wandb.log({"prediction/trajectory_comparison": wandb.Image(plt)})
+    
     plt.close()
     print("Trajectory plot saved.")
 
@@ -573,6 +726,33 @@ def analyze_results(args):
         force_ij_pred = nn_model(relative_vectors)
         force_ji_pred = nn_model(relative_vectors_ji)
         learned_force_vectors = 0.5 * (force_ij_pred - force_ji_pred)
+    
+    force_mse = torch.mean((learned_force_vectors - true_force_vectors)**2).item()
+    force_rmse = force_mse**0.5
+    
+    if args.use_wandb:
+        wandb.log({
+            "prediction/force_mse": force_mse,
+            "prediction/force_rmse": force_rmse,
+            "prediction/max_force_diff": torch.max(torch.abs(learned_force_vectors - true_force_vectors)).item(),
+        })
+        
+        distance_numpy = distances.cpu().numpy()
+        true_force_numpy = true_force_vectors[:, 0].cpu().numpy()
+        learned_force_numpy = learned_force_vectors[:, 0].cpu().numpy()
+        
+        force_data = [[d, t, l, abs(t-l)] for d, t, l in zip(
+            distance_numpy[::10], 
+            true_force_numpy[::10],
+            learned_force_numpy[::10]
+        )]
+        
+        force_table = wandb.Table(
+            columns=["Distance", "True Force", "Learned Force", "Absolute Error"],
+            data=force_data
+        )
+        
+        wandb.log({"prediction/force_comparison_table": force_table})
 
     plt.figure(figsize=(10, 6))
     plt.plot(distances.cpu().numpy(), true_force_vectors[:, 0].cpu().numpy(), 'k-', label='True Potential Force (Fx)')
@@ -586,11 +766,22 @@ def analyze_results(args):
     plt.axhline(0, color='grey', lw=0.5)
     plt.ylim(auto=True)
     plt.savefig(plot_force_path)
+    
+    if args.use_wandb:
+        wandb.log({"prediction/force_comparison": wandb.Image(plt)})
+    
     plt.close()
     print("Force comparison plot saved.")
 
     end_time = time.time()
     print(f"--- Analysis Finished ({end_time - start_time:.2f}s) ---")
+    
+    if args.use_wandb:
+        wandb.run.summary["analysis_time"] = end_time - start_time
+        wandb.run.summary["trajectory_rmse"] = trajectory_rmse
+        wandb.run.summary["force_rmse"] = force_rmse
+        
+        wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the full UDE pipeline: Data Generation -> Training -> Analysis")
@@ -603,6 +794,12 @@ if __name__ == "__main__":
     parser.add_argument('--skip_data_gen', action='store_true', help='Skip data generation if data file exists.')
     parser.add_argument('--skip_training', action='store_true', help='Skip training if model file exists.')
     parser.add_argument('--skip_analysis', action='store_true', help='Skip the final analysis step.')
+    
+    parser.add_argument('--use_wandb', action='store_true', help='Enable logging with Weights & Biases.')
+    parser.add_argument('--wandb_project', type=str, default='ude-nuclear', help='W&B project name.')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity name.')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name. If not provided, will be auto-generated.')
+    parser.add_argument('--wandb_tags', nargs='+', default=[], help='Tags for the W&B run.')
 
     parser.add_argument('--num_collisions', type=int, default=10, help='Number of collisions to simulate for data generation.')
     parser.add_argument('--max_impact_parameter', type=float, default=3.0, help='Maximum impact parameter for collisions.')
@@ -640,7 +837,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     overall_start_time = time.time()
-
+    
+    if args.use_wandb:
+        os.environ["WANDB_SILENT"] = "true"
+        print(f"Weights & Biases logging enabled. Project: {args.wandb_project}")
+    
     if not args.skip_data_gen or not os.path.exists(args.data_file):
         if not args.skip_data_gen and os.path.exists(args.data_file):
              print(f"Data file {args.data_file} exists, but --skip_data_gen not specified. Regenerating data.")
@@ -661,4 +862,21 @@ if __name__ == "__main__":
         print("Skipping analysis.")
 
     overall_end_time = time.time()
-    print(f"\n--- Pipeline Finished ({overall_end_time - overall_start_time:.2f}s) ---")
+    total_runtime = overall_end_time - overall_start_time
+    print(f"\n--- Pipeline Finished ({total_runtime:.2f}s) ---")
+    
+    if args.use_wandb:
+        with wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name or f"pipeline-summary", 
+            config=vars(args),
+            tags=args.wandb_tags + ["pipeline_summary"],
+            resume="allow"
+        ) as run:
+            wandb.summary["total_runtime"] = total_runtime
+            wandb.summary["data_file"] = args.data_file
+            wandb.summary["model_file"] = args.model_save_path
+            wandb.summary["skipped_data_gen"] = args.skip_data_gen
+            wandb.summary["skipped_training"] = args.skip_training
+            wandb.summary["skipped_analysis"] = args.skip_analysis
