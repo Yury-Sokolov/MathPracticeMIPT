@@ -615,7 +615,10 @@ def analyze_results(args):
 
     print(f"Loading trained MLP model from {args.model_load_path}...")
     print("Instantiating MLP model for loading.")
-    nn_model = PotentialNN(hidden_dim=args.nn_hidden_dim).to(device)
+    nn_model = PotentialNN(
+        hidden_dim=args.nn_hidden_dim,
+        num_blocks=args.num_residual_blocks
+    ).to(device)
 
     try:
         nn_model.load_state_dict(torch.load(args.model_load_path, map_location=device))
