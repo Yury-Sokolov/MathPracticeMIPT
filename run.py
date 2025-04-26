@@ -26,7 +26,6 @@ def generate_data(args):
     output_dir = os.path.dirname(args.data_file)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Initialize wandb if enabled
     if args.use_wandb:
         wandb_config = {
             'phase': 'data_generation',
@@ -95,7 +94,6 @@ def generate_data(args):
 
     random_impact_params = np.sqrt(np.random.random(args.num_collisions)) * args.max_impact_parameter
     
-    # Log impact parameters if wandb enabled
     if args.use_wandb:
         wandb.log({"impact_parameters": wandb.Histogram(random_impact_params)})
 
@@ -117,15 +115,12 @@ def generate_data(args):
         if all_masses is None:
             all_masses = sim.nucleons['masses'].cpu()
             
-        # Log collision metrics if wandb enabled
         if args.use_wandb:
-            avg_energy = sim.compute_energy().mean().item()
             max_vel = torch.norm(vel_coll[-1], dim=-1).max().item()
             final_spread = torch.std(pos_coll[-1], dim=0).mean().item()
             
             wandb.log({
                 f"collision_{len(all_times)}/impact_parameter": b,
-                f"collision_{len(all_times)}/avg_energy": avg_energy,
                 f"collision_{len(all_times)}/max_velocity": max_vel,
                 f"collision_{len(all_times)}/final_spatial_spread": final_spread,
                 f"collision_{len(all_times)}/trajectory_length": len(times_coll)
