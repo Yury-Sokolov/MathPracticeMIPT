@@ -498,6 +498,17 @@ def train_ude(args):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            if args.use_wandb:
+                wandb.log({
+                    "batch/loss": avg_batch_loss,
+                    "batch/mse_loss": avg_batch_mse,
+                    "batch/symmetry_loss": avg_batch_sym,
+                    "batch/learning_rate": current_lr,
+                    "batch/memory_usage_gb": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
+                    "batch/batch_size": current_batch_actual_size,
+                    "batch/global_step": epoch * num_batches + i
+                })
+
         batch_pbar.close()
         
         avg_epoch_loss = epoch_loss / num_steps_loss
@@ -510,6 +521,17 @@ def train_ude(args):
         losses.append(avg_epoch_loss)
         
         print(f"Epoch {epoch+1} - Loss: {avg_epoch_loss:.4e}, MSE: {avg_epoch_mse:.4e}, Sym: {avg_epoch_sym:.4e}, LR: {current_lr:.3e}")
+
+        if args.use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": avg_epoch_loss,
+                "train/mse_loss": avg_epoch_mse,
+                "train/symmetry_loss": avg_epoch_sym,
+                "train/learning_rate": current_lr,
+                "train/patience_counter": patience_counter,
+                "train/time_elapsed": time.time() - start_time
+            })
 
         if avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
@@ -554,6 +576,23 @@ def train_ude(args):
     plt.grid(True)
     plt.savefig(plot_loss_path)
     plt.close()
+
+    if args.use_wandb:
+        wandb.log({
+            "train/final_loss": avg_epoch_loss,
+            "train/best_loss": best_loss,
+            "train/total_epochs": epoch + 1,
+            "train/training_time": time.time() - start_time,
+            "train/loss_plot": wandb.Image(plot_loss_path)
+        })
+        
+        model_artifact = wandb.Artifact(
+            name=f"model-{wandb.run.id}", 
+            type="model",
+            description="Trained UDE neural network model"
+        )
+        model_artifact.add_file(args.model_save_path)
+        wandb.log_artifact(model_artifact)
 
     end_time = time.time()
     print(f"--- UDE Training Finished ({end_time - start_time:.2f}s) ---")
