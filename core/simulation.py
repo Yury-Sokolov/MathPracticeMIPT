@@ -34,8 +34,7 @@ class Simulation:
         self.velocities_history = []
         
         can_compile = True
-        if self.neural_network is not None:
-            can_compile = False
+
 
         if can_compile:
             try:
@@ -56,7 +55,7 @@ class Simulation:
                 self._compute_adaptive_dt_compiled = self._compute_adaptive_dt_impl
                 self._update_positions_velocities = self._update_positions_velocities_impl
         else:
-            print("Note: torch.compile skipped (using NN or disabled).")
+            print("Note: torch.compile skipped (compilation disabled).")
             self._compute_adaptive_dt_compiled = self._compute_adaptive_dt_impl
             self._update_positions_velocities = self._update_positions_velocities_impl
 
@@ -101,6 +100,9 @@ class Simulation:
             ], dim=0)
 
     def _compute_nn_forces(self, positions):
+        """
+        Вычисляет силы между частицами с использованием нейронной сети
+        """
         n_particles = positions.shape[0]
         total_forces = torch.zeros_like(positions)
 
@@ -115,7 +117,10 @@ class Simulation:
         pos_j = positions[indices_j]
         relative_pos_ij = pos_i - pos_j
         
-        forces_ij = self.neural_network(relative_pos_ij)  # [pairs, 3]
+        if hasattr(self.neural_network, 'compute_force_compiled'):
+            forces_ij = self.neural_network.compute_force_compiled(relative_pos_ij)
+        else:
+            forces_ij = self.neural_network(relative_pos_ij)
 
         total_forces.index_add_(0, indices_i, forces_ij)
         total_forces.index_add_(0, indices_j, -forces_ij)
@@ -750,12 +755,13 @@ class Simulation:
         kinetic_energy = 0.5 * torch.sum(masses.unsqueeze(1) * torch.sum(velocities**2, dim=-1))
         
         potential_energy = torch.tensor(0.0, device=self.device)
+        positions = self.nucleons['positions']
+        
         if self.potential is not None and hasattr(self.potential, 'compute_energy_per_particle'):
-            particle_potential = self.potential.compute_energy_per_particle(self.nucleons['positions'])
+            particle_potential = self.potential.compute_energy_per_particle(positions)
             potential_energy = torch.sum(particle_potential)
         
         elif self.neural_network is not None:
-            positions = self.nucleons['positions']
             n_particles = positions.shape[0]
             
             indices_i, indices_j = torch.triu_indices(n_particles, n_particles, offset=1)
@@ -767,31 +773,36 @@ class Simulation:
                 pos_j = positions[indices_j]
                 r_ij = pos_i - pos_j
                 
-                distances = torch.norm(r_ij, dim=-1)
-                
-                if hasattr(self, 'potential') and hasattr(self.potential, 'r_cutoff'):
-                    r_cutoff = self.potential.r_cutoff
+                if hasattr(self.neural_network, 'compute_potential_compiled'):
+                    with torch.no_grad():
+                        pair_potentials = self.neural_network.compute_potential_compiled(r_ij)
+                        potential_energy = torch.sum(pair_potentials)
                 else:
-                    r_cutoff = 5.0
-                
-                r_points = torch.linspace(0.1, r_cutoff, 100, device=self.device)
-                r_vectors = torch.zeros((len(r_points), 3), device=self.device)
-                r_vectors[:, 0] = r_points
-                
-                with torch.no_grad():
-                    forces = self.neural_network(r_vectors)
-                    force_x = forces[:, 0]
+                    distances = torch.norm(r_ij, dim=-1)
                     
-                    dr = r_points[1] - r_points[0]
-                    potential_approx = -torch.cumsum(force_x * dr, dim=0)
+                    if hasattr(self, 'potential') and hasattr(self.potential, 'r_cutoff'):
+                        r_cutoff = self.potential.r_cutoff
+                    else:
+                        r_cutoff = 5.0
                     
-                    potential_approx = potential_approx - potential_approx[-1]
+                    r_points = torch.linspace(0.1, r_cutoff, 100, device=self.device)
+                    r_vectors = torch.zeros((len(r_points), 3), device=self.device)
+                    r_vectors[:, 0] = r_points
                     
-                    indices = torch.searchsorted(r_points, distances)
-                    indices = torch.clamp(indices, 0, len(r_points) - 1)
-                    
-                    pair_potentials = potential_approx[indices]
-                    
-                    potential_energy = torch.sum(pair_potentials)
+                    with torch.no_grad():
+                        forces = self.neural_network(r_vectors)
+                        force_x = forces[:, 0]
+                        
+                        dr = r_points[1] - r_points[0]
+                        potential_approx = -torch.cumsum(force_x * dr, dim=0)
+                        
+                        potential_approx = potential_approx - potential_approx[-1]
+                        
+                        indices = torch.searchsorted(r_points, distances)
+                        indices = torch.clamp(indices, 0, len(r_points) - 1)
+                        
+                        pair_potentials = potential_approx[indices]
+                        
+                        potential_energy = torch.sum(pair_potentials)
         
         return kinetic_energy + potential_energy

@@ -324,7 +324,7 @@ def train_ude(args):
     nn_model = PotentialNN(
         hidden_dim=args.nn_hidden_dim, 
         num_blocks=args.num_residual_blocks,
-        max_force=max_accel * 100
+        max_potential=args.max_potential
     ).to(device)
 
     print("Pre-initializing weights to approximate true potential...")
@@ -333,18 +333,43 @@ def train_ude(args):
         test_vectors = torch.zeros((len(test_dists), 3), device=device)
         test_vectors[:, 0] = test_dists
         
+        # Вычисляем истинные силы и потенциалы для инициализации
         true_forces = []
-        for r_vec in test_vectors:
+        true_potentials = []
+        
+        for r_idx, r_vec in enumerate(test_vectors):
             r_tensor = r_vec.reshape(1, 3)
-            true_force = true_potential.compute_force_only(torch.stack([r_tensor[0], -r_tensor[0]]))[0]
+            pos_pair = torch.stack([r_tensor[0], -r_tensor[0]])
+            
+            # Вычисляем истинную силу
+            true_force = true_potential.compute_force_only(pos_pair)[0]
             true_forces.append(true_force)
+            
+            # Вычисляем истинный потенциал (приближенно через интегрирование силы)
+            if r_idx > 0:
+                dr = test_dists[r_idx] - test_dists[r_idx-1]
+                if r_idx == 1:
+                    prev_potential = torch.tensor(0.0, device=device)
+                else:
+                    prev_potential = true_potentials[-1]
+                    
+                # Интегрирование от бесконечности, поэтому -=
+                current_potential = prev_potential - torch.norm(true_force) * dr
+                true_potentials.append(current_potential)
+            else:
+                true_potentials.append(torch.tensor(0.0, device=device))
         
         true_forces = torch.stack(true_forces)
+        true_potentials = torch.stack(true_potentials)
+        
+        # Сдвигаем потенциал так, чтобы минимум был около нуля
+        min_potential = torch.min(true_potentials)
+        true_potentials = true_potentials - min_potential
 
     init_model = PotentialNN(
         hidden_dim=args.nn_hidden_dim, 
         num_blocks=args.num_residual_blocks,
-        max_force=max_accel * 100
+        max_potential=args.max_potential
     ).to(device)
     
     init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
@@ -352,21 +377,31 @@ def train_ude(args):
     for _ in range(100):
         init_optimizer.zero_grad()
         
-        test_vectors_clone = test_vectors.clone().requires_grad_(True)
-        
-        pred_forces = init_model(test_vectors_clone)
-        loss = nn.MSELoss()(pred_forces, true_forces)
-        loss.backward()
+        with torch.enable_grad():
+            test_vectors_clone = test_vectors.clone().requires_grad_(True)
+            
+            pred_potentials = init_model.compute_potential(test_vectors_clone)
+            loss = nn.MSELoss()(pred_potentials, true_potentials)
+            loss.backward()
+            
         init_optimizer.step()
     
     with torch.no_grad():
-        pred_forces_after = init_model(test_vectors)
-        init_error = nn.MSELoss()(pred_forces_after, true_forces).item()
-        print(f"Pre-initialization error: {init_error:.6f}")
+        test_vectors_grad = test_vectors.clone().requires_grad_(True)
+        pred_potentials = init_model.compute_potential(test_vectors_grad)
+        total_potential = torch.sum(pred_potentials)
+        
+        pred_forces = -torch.autograd.grad(
+            total_potential, test_vectors_grad, 
+            create_graph=False, retain_graph=True
+        )[0]
+        
+        force_error = nn.MSELoss()(pred_forces, true_forces).item()
+        print(f"Pre-initialization force error: {force_error:.6f}")
     
     nn_model.load_state_dict(init_model.state_dict())
     
-    del init_model, init_optimizer, test_vectors_clone, pred_forces, loss
+    del init_model, init_optimizer, test_vectors_clone, pred_potentials, loss
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     sim_model = Simulation(
@@ -391,7 +426,7 @@ def train_ude(args):
             if epoch < warmup_epochs:
                 return epoch / warmup_epochs
             cycle_epochs = args.epochs - warmup_epochs
-            cycle_length = cycle_epochs // 3  # 3 цикла
+            cycle_length = cycle_epochs // 3 
             cycle_epoch = (epoch - warmup_epochs) % cycle_length
             return 0.5 * (1 + np.cos(np.pi * cycle_epoch / cycle_length))
         
@@ -431,7 +466,15 @@ def train_ude(args):
             test_vectors = torch.zeros((len(distances), 3), device=device)
             test_vectors[:, 0] = distances
             
-            forces = model(test_vectors)
+            test_vectors_grad = test_vectors.clone().requires_grad_(True)
+            potentials = model.compute_potential(test_vectors_grad)
+            total_potential = torch.sum(potentials)
+            
+            forces = -torch.autograd.grad(
+                total_potential, test_vectors_grad, 
+                create_graph=False, retain_graph=True
+            )[0]
+            
             force_x = forces[:, 0]
             
             max_force = torch.max(torch.abs(force_x)).item()
@@ -497,10 +540,12 @@ def train_ude(args):
                             rel_pos_ij = pos_i - pos_j
                             rel_pos_ji = pos_j - pos_i
                             
-                            force_ij = nn_model(rel_pos_ij.unsqueeze(0)).squeeze(0)
-                            force_ji = nn_model(rel_pos_ji.unsqueeze(0)).squeeze(0)
+                            pot_ij = nn_model.compute_potential(rel_pos_ij.unsqueeze(0)).squeeze(0)
+                            pot_ji = nn_model.compute_potential(rel_pos_ji.unsqueeze(0)).squeeze(0)
                             
-                            symmetry_loss += torch.mean((force_ij + force_ji)**2)
+                            symmetry_loss += torch.mean((pot_ij - pot_ji)**2)
+                            
+                            force_ij = nn_model.compute_force(rel_pos_ij.unsqueeze(0)).squeeze(0)
                             
                             direction_ij = rel_pos_ij / (torch.norm(rel_pos_ij) + 1e-8)
                             projection = torch.sum(force_ij * direction_ij)
@@ -524,7 +569,13 @@ def train_ude(args):
                         
                         test_vectors_detached = test_vectors.clone().detach().requires_grad_(True)
                         
-                        pred_forces = nn_model(test_vectors_detached)
+                        potentials = nn_model.compute_potential(test_vectors_detached)
+                        total_pot = torch.sum(potentials)
+                        pred_forces = -torch.autograd.grad(
+                            total_pot, test_vectors_detached, 
+                            create_graph=True, retain_graph=True
+                        )[0]
+                        
                         pred_force_magnitudes = torch.norm(pred_forces, dim=1)
                         
                         if zero_force_counter > 2:
@@ -560,7 +611,7 @@ def train_ude(args):
                         combined_loss = combined_loss + loss_scale * magnitude_weight * force_magnitude_loss
                     
                     if epoch < 10 and (mse_loss_step > 1.0 or symmetry_loss > 1.0):
-                        all_forces = []
+                        all_potentials = []
                         force_magnitude_penalty = 0.0
                         
                         with torch.enable_grad():
@@ -568,15 +619,14 @@ def train_ude(args):
                                 for j_idx in range(i_idx+1, n_particles):
                                     rel_pos = current_positions[i_idx] - current_positions[j_idx]
                                     rel_pos_detached = rel_pos.clone().detach().requires_grad_(True)
-                                    force_pred = nn_model(rel_pos_detached.unsqueeze(0)).squeeze(0)
-                                    all_forces.append(force_pred)
+                                    
+                                    pot_pred = nn_model.compute_potential(rel_pos_detached.unsqueeze(0)).squeeze(0)
+                                    all_potentials.append(pot_pred)
                         
-                            if all_forces:
-                                forces_tensor = torch.stack(all_forces, dim=0)
-                                force_magnitudes = torch.norm(forces_tensor, dim=1)
-                                
+                            if all_potentials:
+                                potentials_tensor = torch.stack(all_potentials, dim=0)
                                 if epoch > 3:
-                                    force_magnitude_penalty = 0.1 * torch.mean(torch.exp(-5 * force_magnitudes))
+                                    force_magnitude_penalty = 0.1 * torch.mean(torch.exp(-5 * torch.abs(potentials_tensor)))
                         
                         if force_magnitude_penalty > 0:
                             combined_loss = combined_loss + force_magnitude_penalty
@@ -591,8 +641,8 @@ def train_ude(args):
                 
                 del current_positions, current_target_accel, predicted_accels_step, predicted_accels_norm
                 if args.symmetry_weight > 0 and n_particles > 1:
-                    del force_ij, force_ji, pair_indices
-                
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
             if args.clip_grad > 0:
                 torch.nn.utils.clip_grad_norm_(nn_model.parameters(), args.clip_grad)
 
@@ -667,7 +717,7 @@ def train_ude(args):
                     nn_model = PotentialNN(
                         hidden_dim=args.nn_hidden_dim, 
                         num_blocks=args.num_residual_blocks,
-                        max_force=max_accel * 100
+                        max_potential=args.max_potential
                     ).to(device)
                     nn_model.load_state_dict(torch.load(args.model_save_path.replace('.pt', '_best.pt')))
                     
@@ -821,6 +871,7 @@ def analyze_results(args):
     os.makedirs(output_dir, exist_ok=True)
     plot_trajectory_path = os.path.join(output_dir, "ude_trajectory_comparison.png")
     plot_force_path = os.path.join(output_dir, "ude_force_comparison.png")
+    plot_potential_path = os.path.join(output_dir, "ude_potential_comparison.png")
 
     if args.use_wandb:
         wandb_config = {
@@ -868,7 +919,8 @@ def analyze_results(args):
     print("Instantiating MLP model for loading.")
     nn_model = PotentialNN(
         hidden_dim=args.nn_hidden_dim,
-        num_blocks=args.num_residual_blocks
+        num_blocks=args.num_residual_blocks,
+        max_potential=args.max_potential
     ).to(device)
 
     try:
@@ -953,7 +1005,7 @@ def analyze_results(args):
     plt.close()
     print("Trajectory plot saved.")
 
-    print(f"Plotting force comparison to {plot_force_path}...")
+    print(f"Plotting force and potential comparison...")
     true_potential = MesonExchangePotential(**potential_params_loaded)
 
     min_dist = 0.1
@@ -971,21 +1023,39 @@ def analyze_results(args):
     term2 = g_att * torch.exp(-m_pi*r) * (m_pi/r + 1/(r**2))
     true_force_magnitudes = term1 - term2
     true_force_vectors = true_force_magnitudes.unsqueeze(1) * (relative_vectors / r.unsqueeze(1))
-
-    relative_vectors_ji = -relative_vectors
+    
+    true_potential_values = g_rep * torch.exp(-m_rho*r) / r - g_att * torch.exp(-m_pi*r) / r
+    
     with torch.no_grad():
-        force_ij_pred = nn_model(relative_vectors)
-        force_ji_pred = nn_model(relative_vectors_ji)
-        learned_force_vectors = 0.5 * (force_ij_pred - force_ji_pred)
+        relative_vectors_grad = relative_vectors.clone().requires_grad_(True)
+        
+        predicted_potentials = nn_model.compute_potential(relative_vectors_grad)
+        
+        total_potential = torch.sum(predicted_potentials)
+        learned_force_vectors = -torch.autograd.grad(
+            total_potential, relative_vectors_grad, 
+            create_graph=False, retain_graph=True
+        )[0]
     
     force_mse = torch.mean((learned_force_vectors - true_force_vectors)**2).item()
     force_rmse = force_mse**0.5
+    
+    predicted_potentials_norm = predicted_potentials - torch.min(predicted_potentials)
+    true_potential_values_norm = true_potential_values - torch.min(true_potential_values)
+    
+    scaling_factor = torch.max(true_potential_values_norm) / torch.max(predicted_potentials_norm)
+    predicted_potentials_scaled = predicted_potentials_norm * scaling_factor
+    
+    potential_mse = torch.mean((predicted_potentials_scaled - true_potential_values_norm)**2).item()
+    potential_rmse = potential_mse**0.5
     
     if args.use_wandb:
         wandb.log({
             "prediction/force_mse": force_mse,
             "prediction/force_rmse": force_rmse,
             "prediction/max_force_diff": torch.max(torch.abs(learned_force_vectors - true_force_vectors)).item(),
+            "prediction/potential_mse": potential_mse,
+            "prediction/potential_rmse": potential_rmse,
         })
         
         distance_numpy = distances.cpu().numpy()
@@ -1004,6 +1074,19 @@ def analyze_results(args):
         )
         
         wandb.log({"prediction/force_comparison_table": force_table})
+        
+        potential_data = [[d, t, l, abs(t-l)] for d, t, l in zip(
+            distance_numpy[::10], 
+            true_potential_values_norm.cpu().numpy()[::10],
+            predicted_potentials_scaled.cpu().numpy()[::10]
+        )]
+        
+        potential_table = wandb.Table(
+            columns=["Distance", "True Potential", "Learned Potential", "Absolute Error"],
+            data=potential_data
+        )
+        
+        wandb.log({"prediction/potential_comparison_table": potential_table})
 
     plt.figure(figsize=(10, 6))
     plt.plot(distances.cpu().numpy(), true_force_vectors[:, 0].cpu().numpy(), 'k-', label='True Potential Force (Fx)')
@@ -1022,7 +1105,23 @@ def analyze_results(args):
         wandb.log({"prediction/force_comparison": wandb.Image(plt)})
     
     plt.close()
-    print("Force comparison plot saved.")
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(distances.cpu().numpy(), true_potential_values_norm.cpu().numpy(), 'k-', label='True Potential')
+    plt.plot(distances.cpu().numpy(), predicted_potentials_scaled.cpu().numpy(), 'g--', label='Learned MLP Potential')
+
+    plt.xlabel("Distance (r)")
+    plt.ylabel("Potential Energy")
+    plt.title("Comparison of Learned Potential (MLP) vs True Potential")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(plot_potential_path)
+    
+    if args.use_wandb:
+        wandb.log({"prediction/potential_comparison": wandb.Image(plt)})
+    
+    plt.close()
+    print("Force and potential comparison plots saved.")
 
     end_time = time.time()
     print(f"--- Analysis Finished ({end_time - start_time:.2f}s) ---")
@@ -1031,6 +1130,7 @@ def analyze_results(args):
         wandb.run.summary["analysis_time"] = end_time - start_time
         wandb.run.summary["trajectory_rmse"] = trajectory_rmse
         wandb.run.summary["force_rmse"] = force_rmse
+        wandb.run.summary["potential_rmse"] = potential_rmse
         
         wandb.finish()
 
@@ -1084,6 +1184,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_residual_blocks', type=int, default=2, help='Number of residual blocks in the PotentialNN.')
     parser.add_argument('--symmetry_weight', type=float, default=0.1, help='Weight for symmetry loss in the physics-informed loss function.')
     parser.add_argument('--patience', type=int, default=10, help='Patience for early stopping.')
+    parser.add_argument('--max_potential', type=float, default=100.0, help='Maximum potential value for scaling in the PotentialNN model.')
 
     args = parser.parse_args()
 
@@ -1092,6 +1193,8 @@ if __name__ == "__main__":
     if args.use_wandb:
         os.environ["WANDB_SILENT"] = "true"
         print(f"Weights & Biases logging enabled. Project: {args.wandb_project}")
+        print(f"Note: Using enhanced PotentialNN model that predicts scalar potential rather than forces directly.")
+        print(f"      Forces are computed as the gradient of the potential, ensuring conservation laws.")
     
     if not args.skip_data_gen or not os.path.exists(args.data_file):
         if not args.skip_data_gen and os.path.exists(args.data_file):
