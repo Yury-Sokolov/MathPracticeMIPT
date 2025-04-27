@@ -166,8 +166,7 @@ def generate_data(args):
         
         if true_positions_flat.shape[0] > 0 and true_positions_flat.shape[1] > 0:
             fig = plt.figure(figsize=(10, 8))
-            sample_idx = 0  
-            sample_particles = min(5, true_positions_flat.shape[1])  
+            sample_particles = min(5, true_positions_flat.shape[1])
             
             for i in range(sample_particles):
                 plt.plot(true_positions_flat[:100, i, 0].cpu().numpy(), 

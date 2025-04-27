@@ -44,9 +44,6 @@ class PotentialNN(nn.Module):
         
         self._init_weights()
         
-        self.compute_potential_compiled = torch.compile(self.compute_potential)
-        self.compute_force_compiled = torch.compile(self.compute_force)
-        
     def _init_weights(self):
         """Инициализация весов для стабильного обучения"""
         nn.init.kaiming_normal_(self.input_layer.weight, nonlinearity='relu')
@@ -134,4 +131,4 @@ class PotentialNN(nn.Module):
         Returns:
             Тензор векторных сил [batch_size, 3]
         """
-        return self.compute_force_compiled(r_vectors)
+        return self.compute_force(r_vectors)

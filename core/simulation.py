@@ -117,10 +117,7 @@ class Simulation:
         pos_j = positions[indices_j]
         relative_pos_ij = pos_i - pos_j
         
-        if hasattr(self.neural_network, 'compute_force_compiled'):
-            forces_ij = self.neural_network.compute_force_compiled(relative_pos_ij)
-        else:
-            forces_ij = self.neural_network(relative_pos_ij)
+        forces_ij = self.neural_network(relative_pos_ij)
 
         total_forces.index_add_(0, indices_i, forces_ij)
         total_forces.index_add_(0, indices_j, -forces_ij)
@@ -773,36 +770,8 @@ class Simulation:
                 pos_j = positions[indices_j]
                 r_ij = pos_i - pos_j
                 
-                if hasattr(self.neural_network, 'compute_potential_compiled'):
-                    with torch.no_grad():
-                        pair_potentials = self.neural_network.compute_potential_compiled(r_ij)
-                        potential_energy = torch.sum(pair_potentials)
-                else:
-                    distances = torch.norm(r_ij, dim=-1)
-                    
-                    if hasattr(self, 'potential') and hasattr(self.potential, 'r_cutoff'):
-                        r_cutoff = self.potential.r_cutoff
-                    else:
-                        r_cutoff = 5.0
-                    
-                    r_points = torch.linspace(0.1, r_cutoff, 100, device=self.device)
-                    r_vectors = torch.zeros((len(r_points), 3), device=self.device)
-                    r_vectors[:, 0] = r_points
-                    
-                    with torch.no_grad():
-                        forces = self.neural_network(r_vectors)
-                        force_x = forces[:, 0]
-                        
-                        dr = r_points[1] - r_points[0]
-                        potential_approx = -torch.cumsum(force_x * dr, dim=0)
-                        
-                        potential_approx = potential_approx - potential_approx[-1]
-                        
-                        indices = torch.searchsorted(r_points, distances)
-                        indices = torch.clamp(indices, 0, len(r_points) - 1)
-                        
-                        pair_potentials = potential_approx[indices]
-                        
-                        potential_energy = torch.sum(pair_potentials)
+                with torch.no_grad():
+                    pair_potentials = self.neural_network.compute_potential(r_ij)
+                    potential_energy = torch.sum(pair_potentials)
         
         return kinetic_energy + potential_energy
