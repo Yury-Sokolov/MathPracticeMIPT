@@ -461,28 +461,27 @@ def train_ude(args):
     def check_force_profile(model, device):
         """Проверяет, не стремится ли модель к нулевому решению"""
         
-        with torch.no_grad():
-            distances = torch.linspace(0.2, 4.0, 20, device=device)
-            test_vectors = torch.zeros((len(distances), 3), device=device)
-            test_vectors[:, 0] = distances
-            
-            test_vectors_grad = test_vectors.clone().requires_grad_(True)
-            potentials = model.compute_potential(test_vectors_grad)
-            total_potential = torch.sum(potentials)
-            
-            forces = -torch.autograd.grad(
-                total_potential, test_vectors_grad, 
-                create_graph=False, retain_graph=True
-            )[0]
-            
-            force_x = forces[:, 0]
-            
-            max_force = torch.max(torch.abs(force_x)).item()
-            mean_force = torch.mean(torch.abs(force_x)).item()
-            
-            is_zero_like = max_force < 0.01
-            
-            return max_force, mean_force, is_zero_like, force_x.cpu().numpy()
+        distances = torch.linspace(0.2, 4.0, 20, device=device)
+        test_vectors = torch.zeros((len(distances), 3), device=device)
+        test_vectors[:, 0] = distances
+        test_vectors.requires_grad = True
+        
+        potentials = model.compute_potential(test_vectors)
+        total_potential = potentials.sum()
+        
+        forces = -torch.autograd.grad(
+            total_potential, test_vectors, 
+            create_graph=False, retain_graph=True
+        )[0]
+        
+        force_x = forces[:, 0]
+        
+        max_force = torch.max(torch.abs(force_x)).item()
+        mean_force = torch.mean(torch.abs(force_x)).item()
+        
+        is_zero_like = max_force < 0.01
+        
+        return max_force, mean_force, is_zero_like, force_x.cpu().numpy()
     
     for epoch in range(args.epochs):
         epoch_loss = 0.0
@@ -540,14 +539,21 @@ def train_ude(args):
                             rel_pos_ij = pos_i - pos_j
                             rel_pos_ji = pos_j - pos_i
                             
+                            rel_pos_ij.requires_grad = True
+                            
                             pot_ij = nn_model.compute_potential(rel_pos_ij.unsqueeze(0)).squeeze(0)
+                            
                             pot_ji = nn_model.compute_potential(rel_pos_ji.unsqueeze(0)).squeeze(0)
                             
                             symmetry_loss += torch.mean((pot_ij - pot_ji)**2)
                             
-                            force_ij = nn_model.compute_force(rel_pos_ij.unsqueeze(0)).squeeze(0)
+                            total_pot_ij = pot_ij.sum()
+                            force_ij = -torch.autograd.grad(
+                                total_pot_ij, rel_pos_ij,
+                                create_graph=True, retain_graph=True
+                            )[0]
                             
-                            direction_ij = rel_pos_ij / (torch.norm(rel_pos_ij) + 1e-8)
+                            direction_ij = rel_pos_ij.detach() / (torch.norm(rel_pos_ij.detach()) + 1e-8)
                             projection = torch.sum(force_ij * direction_ij)
                             perpendicular = force_ij - projection * direction_ij
                             symmetry_loss += 0.1 * torch.sum(perpendicular**2)
@@ -559,20 +565,20 @@ def train_ude(args):
                     if epoch >= 1:
                         r_cutoff = potential_params.get('r_cutoff', 5.0)
                         
-                        with torch.no_grad():
-                            test_dists = torch.rand(5, device=device) * (r_cutoff - 0.1) + 0.1
-                            test_vectors = torch.zeros((len(test_dists), 3), device=device)
-                            test_vectors[:, 0] = test_dists
-                            
-                            true_test_positions = torch.cat([test_vectors, -test_vectors])
-                            true_forces = true_potential.compute_force_only(true_test_positions)[:len(test_vectors)]
+                        test_dists = torch.rand(5, device=device) * (r_cutoff - 0.1) + 0.1
+                        test_vectors = torch.zeros((len(test_dists), 3), device=device)
+                        test_vectors[:, 0] = test_dists
                         
-                        test_vectors_detached = test_vectors.clone().detach().requires_grad_(True)
+                        true_test_positions = torch.cat([test_vectors, -test_vectors])
+                        true_forces = true_potential.compute_force_only(true_test_positions)[:len(test_vectors)]
                         
-                        potentials = nn_model.compute_potential(test_vectors_detached)
-                        total_pot = torch.sum(potentials)
+                        test_vectors.requires_grad = True
+                        
+                        potentials = nn_model.compute_potential(test_vectors)
+                        total_pot = potentials.sum()
+                        
                         pred_forces = -torch.autograd.grad(
-                            total_pot, test_vectors_detached, 
+                            total_pot, test_vectors, 
                             create_graph=True, retain_graph=True
                         )[0]
                         
@@ -614,19 +620,18 @@ def train_ude(args):
                         all_potentials = []
                         force_magnitude_penalty = 0.0
                         
-                        with torch.enable_grad():
-                            for i_idx in range(n_particles):
-                                for j_idx in range(i_idx+1, n_particles):
-                                    rel_pos = current_positions[i_idx] - current_positions[j_idx]
-                                    rel_pos_detached = rel_pos.clone().detach().requires_grad_(True)
-                                    
-                                    pot_pred = nn_model.compute_potential(rel_pos_detached.unsqueeze(0)).squeeze(0)
-                                    all_potentials.append(pot_pred)
+                        for i_idx in range(n_particles):
+                            for j_idx in range(i_idx+1, n_particles):
+                                rel_pos = current_positions[i_idx] - current_positions[j_idx]
+                                rel_pos.requires_grad = True
+                                
+                                pot_pred = nn_model.compute_potential(rel_pos.unsqueeze(0)).squeeze(0)
+                                all_potentials.append(pot_pred)
                         
-                            if all_potentials:
-                                potentials_tensor = torch.stack(all_potentials, dim=0)
-                                if epoch > 3:
-                                    force_magnitude_penalty = 0.1 * torch.mean(torch.exp(-5 * torch.abs(potentials_tensor)))
+                        if all_potentials:
+                            potentials_tensor = torch.stack(all_potentials, dim=0)
+                            if epoch > 3:
+                                force_magnitude_penalty = 0.1 * torch.mean(torch.exp(-5 * torch.abs(potentials_tensor)))
                         
                         if force_magnitude_penalty > 0:
                             combined_loss = combined_loss + force_magnitude_penalty
@@ -1026,16 +1031,16 @@ def analyze_results(args):
     
     true_potential_values = g_rep * torch.exp(-m_rho*r) / r - g_att * torch.exp(-m_pi*r) / r
     
-    with torch.no_grad():
-        relative_vectors_grad = relative_vectors.clone().requires_grad_(True)
-        
-        predicted_potentials = nn_model.compute_potential(relative_vectors_grad)
-        
-        total_potential = torch.sum(predicted_potentials)
-        learned_force_vectors = -torch.autograd.grad(
-            total_potential, relative_vectors_grad, 
-            create_graph=False, retain_graph=True
-        )[0]
+    relative_vectors.requires_grad = True 
+    
+    predicted_potentials = nn_model.compute_potential(relative_vectors)
+    
+    total_potential = predicted_potentials.sum()
+    
+    learned_force_vectors = -torch.autograd.grad(
+        total_potential, relative_vectors, 
+        create_graph=False, retain_graph=True
+    )[0]
     
     force_mse = torch.mean((learned_force_vectors - true_force_vectors)**2).item()
     force_rmse = force_mse**0.5
