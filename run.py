@@ -333,7 +333,6 @@ def train_ude(args):
         test_vectors = torch.zeros((len(test_dists), 3), device=device)
         test_vectors[:, 0] = test_dists
         
-        # Вычисляем истинные силы и потенциалы для инициализации
         true_forces = []
         true_potentials = []
         
@@ -341,11 +340,9 @@ def train_ude(args):
             r_tensor = r_vec.reshape(1, 3)
             pos_pair = torch.stack([r_tensor[0], -r_tensor[0]])
             
-            # Вычисляем истинную силу
             true_force = true_potential.compute_force_only(pos_pair)[0]
             true_forces.append(true_force)
             
-            # Вычисляем истинный потенциал (приближенно через интегрирование силы)
             if r_idx > 0:
                 dr = test_dists[r_idx] - test_dists[r_idx-1]
                 if r_idx == 1:
@@ -353,7 +350,6 @@ def train_ude(args):
                 else:
                     prev_potential = true_potentials[-1]
                     
-                # Интегрирование от бесконечности, поэтому -=
                 current_potential = prev_potential - torch.norm(true_force) * dr
                 true_potentials.append(current_potential)
             else:
@@ -362,7 +358,6 @@ def train_ude(args):
         true_forces = torch.stack(true_forces)
         true_potentials = torch.stack(true_potentials)
         
-        # Сдвигаем потенциал так, чтобы минимум был около нуля
         min_potential = torch.min(true_potentials)
         true_potentials = true_potentials - min_potential
 
@@ -383,7 +378,7 @@ def train_ude(args):
             pred_potentials = init_model.compute_potential(test_vectors_clone)
             loss = nn.MSELoss()(pred_potentials, true_potentials)
             loss.backward()
-            
+        
         init_optimizer.step()
     
     with torch.no_grad():
@@ -464,7 +459,7 @@ def train_ude(args):
         distances = torch.linspace(0.2, 4.0, 20, device=device)
         test_vectors = torch.zeros((len(distances), 3), device=device)
         test_vectors[:, 0] = distances
-        test_vectors.requires_grad = True
+        test_vectors.requires_grad_(True)
         
         potentials = model.compute_potential(test_vectors)
         total_potential = potentials.sum()
@@ -539,7 +534,7 @@ def train_ude(args):
                             rel_pos_ij = pos_i - pos_j
                             rel_pos_ji = pos_j - pos_i
                             
-                            rel_pos_ij.requires_grad = True
+                            rel_pos_ij.requires_grad_(True)
                             
                             pot_ij = nn_model.compute_potential(rel_pos_ij.unsqueeze(0)).squeeze(0)
                             
@@ -572,7 +567,7 @@ def train_ude(args):
                         true_test_positions = torch.cat([test_vectors, -test_vectors])
                         true_forces = true_potential.compute_force_only(true_test_positions)[:len(test_vectors)]
                         
-                        test_vectors.requires_grad = True
+                        test_vectors.requires_grad_(True)
                         
                         potentials = nn_model.compute_potential(test_vectors)
                         total_pot = potentials.sum()
@@ -1031,7 +1026,7 @@ def analyze_results(args):
     
     true_potential_values = g_rep * torch.exp(-m_rho*r) / r - g_att * torch.exp(-m_pi*r) / r
     
-    relative_vectors.requires_grad = True 
+    relative_vectors.requires_grad_(True) 
     
     predicted_potentials = nn_model.compute_potential(relative_vectors)
     
