@@ -545,7 +545,7 @@ def train_ude(args):
                             total_pot_ij = pot_ij.sum()
                             force_ij = -torch.autograd.grad(
                                 total_pot_ij, rel_pos_ij,
-                                create_graph=True, retain_graph=True
+                                create_graph=False, retain_graph=True
                             )[0]
                             
                             direction_ij = rel_pos_ij.detach() / (torch.norm(rel_pos_ij.detach()) + 1e-8)
@@ -574,7 +574,7 @@ def train_ude(args):
                         
                         pred_forces = -torch.autograd.grad(
                             total_pot, test_vectors, 
-                            create_graph=True, retain_graph=True
+                            create_graph=False, retain_graph=True
                         )[0]
                         
                         pred_force_magnitudes = torch.norm(pred_forces, dim=1)
@@ -618,7 +618,7 @@ def train_ude(args):
                         for i_idx in range(n_particles):
                             for j_idx in range(i_idx+1, n_particles):
                                 rel_pos = current_positions[i_idx] - current_positions[j_idx]
-                                rel_pos.requires_grad = True
+                                rel_pos.requires_grad_(True)
                                 
                                 pot_pred = nn_model.compute_potential(rel_pos.unsqueeze(0)).squeeze(0)
                                 all_potentials.append(pot_pred)
