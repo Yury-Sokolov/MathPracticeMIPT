@@ -328,7 +328,7 @@ def train_ude(args):
     ).to(device)
 
     print("Pre-initializing weights to approximate true potential...")
-    with torch.no_grad():
+    with torch.enable_grad():
         test_dists = torch.linspace(0.1, potential_params['r_cutoff'], 50, device=device)
         test_vectors = torch.zeros((len(test_dists), 3), device=device)
         test_vectors[:, 0] = test_dists
@@ -381,7 +381,7 @@ def train_ude(args):
         
         init_optimizer.step()
     
-    with torch.no_grad():
+    with torch.enable_grad():
         test_vectors_grad = test_vectors.clone().requires_grad_(True)
         pred_potentials = init_model.compute_potential(test_vectors_grad)
         total_potential = torch.sum(pred_potentials)
