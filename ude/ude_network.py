@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+import math
 
 class ResidualBlock(nn.Module):
 
@@ -24,13 +24,14 @@ class ResidualBlock(nn.Module):
 
 class PotentialNN(nn.Module):
 
-    def __init__(self, hidden_dim=64, num_blocks=2, input_dim=3, output_dim=3):
+    def __init__(self, hidden_dim=128, num_blocks=3, input_dim=3, output_dim=3, max_force=1000.0):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.max_force = max_force
         
-        self.input_layer = nn.Linear(input_dim+1, hidden_dim)
+        self.input_layer = nn.Linear(input_dim+4, hidden_dim)
         self.input_norm = nn.LayerNorm(hidden_dim)
         
         self.res_blocks = nn.ModuleList([
@@ -38,35 +39,57 @@ class PotentialNN(nn.Module):
         ])
         
         self.output_layer1 = nn.Linear(hidden_dim, hidden_dim)
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.output_layer2 = nn.Linear(hidden_dim, output_dim)
+        self.output_norm1 = nn.LayerNorm(hidden_dim)
+        self.output_layer2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.output_norm2 = nn.LayerNorm(hidden_dim // 2)
+        self.output_layer3 = nn.Linear(hidden_dim // 2, output_dim)
         
         self._init_weights()
         
     def _init_weights(self):
-        """Initialize weights with small values for better stability"""
+
         nn.init.kaiming_normal_(self.input_layer.weight, nonlinearity='relu')
         nn.init.zeros_(self.input_layer.bias)
         
         nn.init.kaiming_normal_(self.output_layer1.weight, nonlinearity='relu')
         nn.init.zeros_(self.output_layer1.bias)
         
-        nn.init.normal_(self.output_layer2.weight, mean=0.0, std=0.01)
+        nn.init.kaiming_normal_(self.output_layer2.weight, nonlinearity='relu')
         nn.init.zeros_(self.output_layer2.bias)
         
+        nn.init.normal_(self.output_layer3.weight, mean=0.0, std=0.1)
+        nn.init.constant_(self.output_layer3.bias, -0.1)
+        
     def forward(self, x):
-
+        """
+        Прямой проход сети, возвращающей вектор силы для заданной разности положений
+        
+        Args:
+            x: Тензор разности положений [batch_size, 3]
+            
+        Returns:
+            torch.Tensor: Сила [batch_size, 3]
+        """
         batch_size = x.shape[0]
         
         dist = torch.norm(x, dim=-1, keepdim=True)
-        
         safe_dist = torch.clamp(dist, min=1e-6)
         
-        x_scaled = x / (safe_dist + 1.0)
+        direction = x / safe_dist
         
-        x_with_dist = torch.cat([x_scaled, torch.log1p(safe_dist)], dim=-1)
+        inverse_dist = 1.0 / (safe_dist + 0.1)
+        exp_short = torch.exp(-5.0 * safe_dist)
+        exp_long = torch.exp(-0.5 * safe_dist)
         
-        h = self.input_layer(x_with_dist)
+        x_features = torch.cat([
+            direction,
+            safe_dist,
+            inverse_dist,
+            exp_short,
+            exp_long
+        ], dim=-1)
+        
+        h = self.input_layer(x_features)
         h = self.input_norm(h)
         h = F.silu(h)
         
@@ -74,14 +97,20 @@ class PotentialNN(nn.Module):
             h = block(h)
         
         h = self.output_layer1(h)
-        h = self.output_norm(h)
+        h = self.output_norm1(h)
         h = F.silu(h)
-        force = self.output_layer2(h)
         
-        direction = x / safe_dist
-        force_magnitude = torch.sum(force * direction, dim=-1, keepdim=True)
+        h = self.output_layer2(h)
+        h = self.output_norm2(h)
+        h = F.silu(h)
         
-        force_magnitude = torch.tanh(force_magnitude) * 5.0
-        force = force_magnitude * direction
+        force_vector = self.output_layer3(h)
         
-        return force
+        force_magnitude = torch.sum(force_vector * direction, dim=-1, keepdim=True)
+        
+        scaling_factor = 2.0 * self.max_force / math.pi
+        force_magnitude = scaling_factor * torch.atan(force_magnitude / scaling_factor)
+        
+        radial_force = force_magnitude * direction
+        
+        return radial_force
