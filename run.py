@@ -310,13 +310,11 @@ def train_ude(args):
     normalized_positions = (data['noisy_positions'] - pos_mean) / (pos_std + 1e-8)
     normalized_positions_for_loss = normalized_positions[:-1]
     
-    # Анализ целевых ускорений для лучшего понимания данных
     accel_magnitudes = torch.norm(normalized_accel, dim=-1)
     max_accel = torch.max(accel_magnitudes).item()
     mean_accel = torch.mean(accel_magnitudes).item()
     print(f"Target acceleration stats: Max={max_accel:.4f}, Mean={mean_accel:.4f}")
     
-    # Получаем истинные силовые взаимодействия для использования в качестве референса
     potential_params = data['potential_params'].copy()
     potential_params['device'] = device
     true_potential = MesonExchangePotential(**potential_params)
@@ -326,18 +324,15 @@ def train_ude(args):
     nn_model = PotentialNN(
         hidden_dim=args.nn_hidden_dim, 
         num_blocks=args.num_residual_blocks,
-        max_force=max_accel * 100  # Задаем максимальную силу на основе данных
+        max_force=max_accel * 100
     ).to(device)
 
-    # Предварительно инициализируем веса нейронной сети, чтобы лучше соответствовать потенциалу
     print("Pre-initializing weights to approximate true potential...")
     with torch.no_grad():
-        # Создаем тестовые векторы расстояний для инициализации
         test_dists = torch.linspace(0.1, potential_params['r_cutoff'], 50, device=device)
         test_vectors = torch.zeros((len(test_dists), 3), device=device)
         test_vectors[:, 0] = test_dists
         
-        # Вычисляем истинные силы от потенциала
         true_forces = []
         for r_vec in test_vectors:
             r_tensor = r_vec.reshape(1, 3)
@@ -345,21 +340,34 @@ def train_ude(args):
             true_forces.append(true_force)
         
         true_forces = torch.stack(true_forces)
+
+    init_model = PotentialNN(
+        hidden_dim=args.nn_hidden_dim, 
+        num_blocks=args.num_residual_blocks,
+        max_force=max_accel * 100
+    ).to(device)
+    
+    init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
+    
+    for _ in range(100):
+        init_optimizer.zero_grad()
         
-        # Делаем несколько шагов градиентного спуска для приближения к истинному потенциалу
-        optimizer = optim.Adam(nn_model.parameters(), lr=0.01)
-        for _ in range(100):
-            pred_forces = nn_model(test_vectors)
-            loss = nn.MSELoss()(pred_forces, true_forces)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        test_vectors_clone = test_vectors.clone().requires_grad_(True)
         
-        # Проверяем качество инициализации
-        with torch.no_grad():
-            pred_forces_after = nn_model(test_vectors)
-            init_error = nn.MSELoss()(pred_forces_after, true_forces).item()
-            print(f"Pre-initialization error: {init_error:.6f}")
+        pred_forces = init_model(test_vectors_clone)
+        loss = nn.MSELoss()(pred_forces, true_forces)
+        loss.backward()
+        init_optimizer.step()
+    
+    with torch.no_grad():
+        pred_forces_after = init_model(test_vectors)
+        init_error = nn.MSELoss()(pred_forces_after, true_forces).item()
+        print(f"Pre-initialization error: {init_error:.6f}")
+    
+    nn_model.load_state_dict(init_model.state_dict())
+    
+    del init_model, init_optimizer, test_vectors_clone, pred_forces, loss
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     sim_model = Simulation(
         potential=None, neural_network=nn_model,
@@ -370,7 +378,6 @@ def train_ude(args):
     )
     sim_model.nucleons['masses'] = masses
     
-    # Используем комбинацию оптимизаторов для лучшего обучения
     optimizer = optim.AdamW(nn_model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     if args.use_wandb:
@@ -383,7 +390,6 @@ def train_ude(args):
         def lr_lambda(epoch):
             if epoch < warmup_epochs:
                 return epoch / warmup_epochs
-            # Используем косинусный цикл с перезапуском
             cycle_epochs = args.epochs - warmup_epochs
             cycle_length = cycle_epochs // 3  # 3 цикла
             cycle_epoch = (epoch - warmup_epochs) % cycle_length
@@ -393,16 +399,14 @@ def train_ude(args):
     else:
         scheduler = None
     
-    # Начинаем с большой скорости обучения для избежания локальных минимумов
     for param_group in optimizer.param_groups:
         param_group['initial_lr'] = args.learning_rate
-        param_group['lr'] = args.learning_rate * 2  # Начинаем с повышенной скорости
+        param_group['lr'] = args.learning_rate * 2
 
     losses = []
-    force_profile_history = []  # История профилей сил для отслеживания прогресса
+    force_profile_history = []
     
-    had_nan_loss = False
-    
+
     print(f"Starting training for {args.epochs} epochs...")
     num_steps_loss = normalized_accel.shape[0]
     
@@ -417,24 +421,22 @@ def train_ude(args):
 
     best_loss = float('inf')
     patience_counter = 0
-    zero_force_counter = 0  # Счетчик эпох с близкими к нулю силами
+    zero_force_counter = 0
     
-    # Добавляем механизм предотвращения схождения к нулевому решению
     def check_force_profile(model, device):
         """Проверяет, не стремится ли модель к нулевому решению"""
-        distances = torch.linspace(0.2, 4.0, 20, device=device)
-        test_vectors = torch.zeros((len(distances), 3), device=device)
-        test_vectors[:, 0] = distances
         
         with torch.no_grad():
-            forces = model(test_vectors)
-            force_x = forces[:, 0]  # радиальная компонента
+            distances = torch.linspace(0.2, 4.0, 20, device=device)
+            test_vectors = torch.zeros((len(distances), 3), device=device)
+            test_vectors[:, 0] = distances
             
-            # Вычисляем профиль силы
+            forces = model(test_vectors)
+            force_x = forces[:, 0]
+            
             max_force = torch.max(torch.abs(force_x)).item()
             mean_force = torch.mean(torch.abs(force_x)).item()
             
-            # Проверяем, не стали ли силы слишком близкими к нулю
             is_zero_like = max_force < 0.01
             
             return max_force, mean_force, is_zero_like, force_x.cpu().numpy()
@@ -443,7 +445,7 @@ def train_ude(args):
         epoch_loss = 0.0
         epoch_mse_loss = 0.0
         epoch_symmetry_loss = 0.0
-        epoch_force_magnitude_loss = 0.0  # Новый компонент для контроля магнитуды силы
+        epoch_force_magnitude_loss = 0.0
         
         permuted_indices = torch.randperm(num_steps_loss).tolist()
 
@@ -498,10 +500,8 @@ def train_ude(args):
                             force_ij = nn_model(rel_pos_ij.unsqueeze(0)).squeeze(0)
                             force_ji = nn_model(rel_pos_ji.unsqueeze(0)).squeeze(0)
                             
-                            # Проверка закона действия и противодействия
                             symmetry_loss += torch.mean((force_ij + force_ji)**2)
                             
-                            # Проверка радиальности силы (должна быть направлена вдоль линии между частицами)
                             direction_ij = rel_pos_ij / (torch.norm(rel_pos_ij) + 1e-8)
                             projection = torch.sum(force_ij * direction_ij)
                             perpendicular = force_ij - projection * direction_ij
@@ -509,38 +509,40 @@ def train_ude(args):
                         
                         symmetry_loss /= max(1, num_pairs)
                     
-                    # Дополнительный компонент потери для контроля магнитуды силы
-                    # Генерируем случайные расстояния от 0.1 до r_cutoff и проверяем силы
+
                     force_magnitude_loss = 0.0
-                    if epoch >= 5:  # Начинаем добавлять после некоторого обучения
+                    if epoch >= 1:
                         r_cutoff = potential_params.get('r_cutoff', 5.0)
-                        test_dists = torch.rand(5, device=device) * (r_cutoff - 0.1) + 0.1
-                        test_vectors = torch.zeros((len(test_dists), 3), device=device)
-                        test_vectors[:, 0] = test_dists
                         
-                        pred_forces = nn_model(test_vectors)
+                        with torch.no_grad():
+                            test_dists = torch.rand(5, device=device) * (r_cutoff - 0.1) + 0.1
+                            test_vectors = torch.zeros((len(test_dists), 3), device=device)
+                            test_vectors[:, 0] = test_dists
+                            
+                            true_test_positions = torch.cat([test_vectors, -test_vectors])
+                            true_forces = true_potential.compute_force_only(true_test_positions)[:len(test_vectors)]
+                        
+                        test_vectors_detached = test_vectors.clone().detach().requires_grad_(True)
+                        
+                        pred_forces = nn_model(test_vectors_detached)
                         pred_force_magnitudes = torch.norm(pred_forces, dim=1)
                         
-                        # Штрафуем близкие к нулю силы для предотвращения тривиального решения
-                        if zero_force_counter > 2:  # Если модель несколько эпох дает почти нулевые силы
+                        if zero_force_counter > 2:
                             force_magnitude_loss += torch.mean(torch.exp(-10 * pred_force_magnitudes))
                             
-                        # Также можно добавить компонент для сравнения с истинным потенциалом
-                        true_test_positions = torch.cat([test_vectors, -test_vectors])
-                        true_forces = true_potential.compute_force_only(true_test_positions)[:len(test_vectors)]
-                        force_magnitude_loss += 0.1 * torch.mean((pred_forces - true_forces)**2)
+                        force_magnitude_loss += 0.1 * torch.mean((pred_forces - true_forces.to(device))**2)
                     
                     current_sym_weight = args.symmetry_weight
                     if epoch < args.epochs // 4:
                         current_sym_weight *= 0.5
                     elif epoch > args.epochs * 3 // 4:
-                        current_sym_weight *= 2.0  # Увеличиваем вес симметрии в конце обучения
+                        current_sym_weight *= 2.0
                     
                     magnitude_weight = 0.0
-                    if zero_force_counter > 2:  # Если модель стремится к нулевому решению
-                        magnitude_weight = 2.0  # Сильно увеличиваем вес компонента магнитуды
+                    if zero_force_counter > 2:
+                        magnitude_weight = 2.0
                     elif epoch >= 5:
-                        magnitude_weight = 0.2  # Иначе умеренный вес
+                        magnitude_weight = 0.2
                     
                     mse_loss_clamped = mse_loss_step
                     symmetry_loss_clamped = symmetry_loss
@@ -551,25 +553,33 @@ def train_ude(args):
                     
                     combined_loss = loss_scale * (
                         mse_loss_clamped + 
-                        current_sym_weight * symmetry_loss_clamped + 
-                        magnitude_weight * force_magnitude_loss
+                        current_sym_weight * symmetry_loss_clamped
                     )
+                    
+                    if magnitude_weight > 0 and force_magnitude_loss > 0:
+                        combined_loss = combined_loss + loss_scale * magnitude_weight * force_magnitude_loss
                     
                     if epoch < 10 and (mse_loss_step > 1.0 or symmetry_loss > 1.0):
                         all_forces = []
-                        for i in range(n_particles):
-                            for j in range(i+1, n_particles):
-                                rel_pos = current_positions[i] - current_positions[j]
-                                all_forces.append(nn_model(rel_pos.unsqueeze(0)).squeeze(0))
+                        force_magnitude_penalty = 0.0
                         
-                        if all_forces:
-                            forces_tensor = torch.stack(all_forces, dim=0)
-                            force_magnitudes = torch.norm(forces_tensor, dim=1)
-                            
-                            # Вместо штрафа за большие силы, штрафуем за слишком малые
-                            if epoch > 3:
-                                magnitude_penalty = 0.1 * torch.mean(torch.exp(-5 * force_magnitudes))
-                                combined_loss = combined_loss + magnitude_penalty
+                        with torch.enable_grad():
+                            for i_idx in range(n_particles):
+                                for j_idx in range(i_idx+1, n_particles):
+                                    rel_pos = current_positions[i_idx] - current_positions[j_idx]
+                                    rel_pos_detached = rel_pos.clone().detach().requires_grad_(True)
+                                    force_pred = nn_model(rel_pos_detached.unsqueeze(0)).squeeze(0)
+                                    all_forces.append(force_pred)
+                        
+                            if all_forces:
+                                forces_tensor = torch.stack(all_forces, dim=0)
+                                force_magnitudes = torch.norm(forces_tensor, dim=1)
+                                
+                                if epoch > 3:
+                                    force_magnitude_penalty = 0.1 * torch.mean(torch.exp(-5 * force_magnitudes))
+                        
+                        if force_magnitude_penalty > 0:
+                            combined_loss = combined_loss + force_magnitude_penalty
                 
                     step_loss = combined_loss / current_batch_actual_size
                     step_loss.backward()
@@ -651,33 +661,29 @@ def train_ude(args):
                 
                 if os.path.exists(args.model_save_path.replace('.pt', '_best.pt')):
                     print("Loading best model and increasing learning rate...")
+                    del nn_model
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    
+                    nn_model = PotentialNN(
+                        hidden_dim=args.nn_hidden_dim, 
+                        num_blocks=args.num_residual_blocks,
+                        max_force=max_accel * 100
+                    ).to(device)
                     nn_model.load_state_dict(torch.load(args.model_save_path.replace('.pt', '_best.pt')))
                     
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = args.learning_rate * 5.0
-                
+                    sim_model.neural_network = nn_model
+                    
+                    optimizer = optim.AdamW(nn_model.parameters(), lr=args.learning_rate * 5.0, weight_decay=args.weight_decay)
                 else:
                     print("Re-initializing network weights...")
                     with torch.no_grad():
-                        test_dists = torch.linspace(0.1, potential_params['r_cutoff'], 50, device=device)
-                        test_vectors = torch.zeros((len(test_dists), 3), device=device)
-                        test_vectors[:, 0] = test_dists
+                        for name, param in nn_model.named_parameters():
+                            if 'output_layer3.weight' in name:
+                                param.data.normal_(0, 0.1)
+                            elif 'output_layer3.bias' in name:
+                                param.data.fill_(-0.1)
                         
-                        true_forces = []
-                        for r_vec in test_vectors:
-                            r_tensor = r_vec.reshape(1, 3)
-                            true_force = true_potential.compute_force_only(torch.stack([r_tensor[0], -r_tensor[0]]))[0]
-                            true_forces.append(true_force)
-                        
-                        true_forces = torch.stack(true_forces)
-                        
-                        optimizer = optim.Adam(nn_model.parameters(), lr=0.01)
-                        for _ in range(200):
-                            pred_forces = nn_model(test_vectors)
-                            loss = nn.MSELoss()(pred_forces, true_forces)
-                            optimizer.zero_grad()
-                            loss.backward()
-                            optimizer.step()
+                        optimizer = optim.AdamW(nn_model.parameters(), lr=args.learning_rate * 2.0, weight_decay=args.weight_decay)
                 
                 zero_force_counter = 0
         else:
