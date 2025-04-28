@@ -397,13 +397,19 @@ def train_ude(args):
     true_forces = torch.zeros_like(test_vectors)
     true_forces[:, 0] = true_force_magnitudes
     
-    init_model = type(nn_model)(
-        hidden_dim=args.nn_hidden_dim, 
-        num_layers=args.num_residual_blocks if isinstance(nn_model, KANPotentialModel) else None,
-        num_blocks=args.num_residual_blocks if isinstance(nn_model, PotentialNN) else None,
-        max_potential=args.max_potential,
-        dropout_rate=args.dropout_rate if isinstance(nn_model, PotentialNN) else None
-    ).to(device)
+    if isinstance(nn_model, KANPotentialModel):
+        init_model = KANPotentialModel(
+            hidden_dim=args.nn_hidden_dim, 
+            num_layers=args.num_residual_blocks,
+            max_potential=args.max_potential
+        ).to(device)
+    else:
+        init_model = PotentialNN(
+            hidden_dim=args.nn_hidden_dim,
+            num_blocks=args.num_residual_blocks,
+            max_potential=args.max_potential,
+            dropout_rate=args.dropout_rate
+        ).to(device)
     
     init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
     
