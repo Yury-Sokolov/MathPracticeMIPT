@@ -792,7 +792,7 @@ def train_ude(args):
     
     plot_force_evolution_path = os.path.join(output_dir, "force_profile_evolution.png")
     print(f"Saving force profile evolution plot to {plot_force_evolution_path}...")
-    distances = np.linspace(0.2, 4.0, 20)
+    distances = np.linspace(0.2, 4.0, 40)
     
     plt.figure(figsize=(12, 8))
     
