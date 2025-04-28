@@ -10,6 +10,12 @@ import argparse
 import time
 import wandb
 import torch.nn.functional as F
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+
+from ude.ude_network import PotentialNN, KANPotentialModel, LossManager
+from potential.potential import MesonExchangePotential
+from core.simulation import Simulation
 
 try:
     from core import Simulation
@@ -233,13 +239,14 @@ def train_ude(args):
             'symmetry_weight': args.symmetry_weight,
             'clip_grad': args.clip_grad,
             'patience': args.patience,
+            'model_type': args.model_type,
             'device': args.device
         }
         
         run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
-            name=args.wandb_run_name or f"train-ude-{args.nn_hidden_dim}d-{args.epochs}e", 
+            name=args.wandb_run_name or f"train-ude-{args.model_type}-{args.nn_hidden_dim}d-{args.epochs}e", 
             config=wandb_config,
             tags=args.wandb_tags + ["training"],
             resume="allow"
@@ -275,12 +282,20 @@ def train_ude(args):
     else:
         dt = 0.001
         print("Warning: Could not robustly determine original dt. Using default 0.001")
+    
+    train_indices, val_indices = train_test_split(
+        np.arange(data['noisy_positions'].shape[0]), 
+        test_size=0.1, 
+        random_state=42
+    )
+    
+    print(f"Training on {len(train_indices)} samples, validating on {len(val_indices)} samples")
 
     print("Computing normalization statistics...")
-    pos_mean = torch.mean(data['noisy_positions'], dim=(0, 1))
-    pos_std = torch.std(data['noisy_positions'], dim=(0, 1))
-    vel_mean = torch.mean(data['noisy_velocities'], dim=(0, 1))
-    vel_std = torch.std(data['noisy_velocities'], dim=(0, 1))
+    pos_mean = torch.mean(data['noisy_positions'][train_indices], dim=(0, 1))
+    pos_std = torch.std(data['noisy_positions'][train_indices], dim=(0, 1))
+    vel_mean = torch.mean(data['noisy_velocities'][train_indices], dim=(0, 1))
+    vel_std = torch.std(data['noisy_velocities'][train_indices], dim=(0, 1))
     
     pos_std = torch.max(pos_std, torch.ones_like(pos_std) * 1e-8)
     vel_std = torch.max(vel_std, torch.ones_like(vel_std) * 1e-8)
@@ -323,13 +338,40 @@ def train_ude(args):
     true_potential = MesonExchangePotential(**potential_params)
     
     print("Initializing neural network and simulation...")
-    print("Using enhanced PotentialNN model with physics-informed architecture.")
-    nn_model = PotentialNN(
-        hidden_dim=args.nn_hidden_dim, 
-        num_blocks=args.num_residual_blocks,
-        max_potential=args.max_potential
-    ).to(device)
+    if args.model_type == 'potential_nn':
+        print("Using enhanced PotentialNN model with physics-informed architecture.")
+        nn_model = PotentialNN(
+            hidden_dim=args.nn_hidden_dim, 
+            num_blocks=args.num_residual_blocks,
+            max_potential=args.max_potential,
+            dropout_rate=args.dropout_rate
+        ).to(device)
+    elif args.model_type == 'kan':
+        print("Using Kolmogorov-Arnold Network (KAN) model for potential learning.")
+        try:
+            nn_model = KANPotentialModel(
+                hidden_dim=args.nn_hidden_dim,
+                num_layers=args.num_residual_blocks,
+                max_potential=args.max_potential
+            ).to(device)
+        except ImportError:
+            print("Error: KAN model requires pykan library. Falling back to PotentialNN")
+            nn_model = PotentialNN(
+                hidden_dim=args.nn_hidden_dim, 
+                num_blocks=args.num_residual_blocks,
+                max_potential=args.max_potential,
+                dropout_rate=args.dropout_rate
+            ).to(device)
+    else:
+        raise ValueError(f"Unknown model type: {args.model_type}")
 
+    loss_manager = LossManager(
+        potential_weight=0.5,
+        force_weight=1.0,
+        smoothness_weight=args.smoothness_weight,
+        symmetric_weight=args.symmetry_weight
+    )
+    
     print("Pre-initializing weights to match true potential curve...")
     r_cutoff = potential_params.get('r_cutoff', 5.0)
     
@@ -355,10 +397,12 @@ def train_ude(args):
     true_forces = torch.zeros_like(test_vectors)
     true_forces[:, 0] = true_force_magnitudes
     
-    init_model = PotentialNN(
+    init_model = type(nn_model)(
         hidden_dim=args.nn_hidden_dim, 
-        num_blocks=args.num_residual_blocks,
-        max_potential=args.max_potential
+        num_layers=args.num_residual_blocks if isinstance(nn_model, KANPotentialModel) else None,
+        num_blocks=args.num_residual_blocks if isinstance(nn_model, PotentialNN) else None,
+        max_potential=args.max_potential,
+        dropout_rate=args.dropout_rate if isinstance(nn_model, PotentialNN) else None
     ).to(device)
     
     init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
@@ -420,25 +464,71 @@ def train_ude(args):
     )
     sim_model.nucleons['masses'] = masses
     
-    optimizer = optim.AdamW(nn_model.parameters(), 
-                           lr=args.learning_rate, 
-                           weight_decay=args.weight_decay,
-                           betas=(0.9, 0.999))
+    # Улучшенный оптимизатор с нормализацией градиентов
+    if args.optimizer == 'adamw':
+        optimizer = optim.AdamW(nn_model.parameters(), 
+                              lr=args.learning_rate, 
+                              weight_decay=args.weight_decay,
+                              betas=(0.9, 0.999))
+    elif args.optimizer == 'adam':
+        optimizer = optim.Adam(nn_model.parameters(),
+                              lr=args.learning_rate,
+                              betas=(0.9, 0.999))
+    elif args.optimizer == 'sgd':
+        optimizer = optim.SGD(nn_model.parameters(),
+                             lr=args.learning_rate,
+                             momentum=0.9,
+                             nesterov=True)
+    else:
+        print(f"Unknown optimizer: {args.optimizer}, falling back to AdamW")
+        optimizer = optim.AdamW(nn_model.parameters(), 
+                              lr=args.learning_rate, 
+                              weight_decay=args.weight_decay,
+                              betas=(0.9, 0.999))
     
     if args.use_wandb:
         wandb.watch(nn_model, log="all", log_freq=10)
     
+    # Улучшенный шедулер для более стабильного обучения
     if args.use_scheduler:
-        print(f"Using OneCycleLR scheduler for faster convergence")
-        
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, 
-            max_lr=args.learning_rate * 10,
-            total_steps=args.epochs,
-            pct_start=0.3,
-            div_factor=10.0,
-            final_div_factor=100.0
-        )
+        if args.scheduler_type == 'one_cycle':
+            print(f"Using OneCycleLR scheduler for faster convergence")
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, 
+                max_lr=args.learning_rate * 10,
+                total_steps=args.epochs,
+                pct_start=0.3,
+                div_factor=10.0,
+                final_div_factor=100.0
+            )
+        elif args.scheduler_type == 'cosine':
+            print(f"Using CosineAnnealingWarmRestarts scheduler")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=args.epochs // 10 + 5,
+                T_mult=2,
+                eta_min=args.learning_rate * 0.01
+            )
+        elif args.scheduler_type == 'reduce_on_plateau':
+            print(f"Using ReduceLROnPlateau scheduler")
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,
+                patience=5,
+                threshold=0.0001,
+                verbose=True
+            )
+        else:
+            print(f"Unknown scheduler type: {args.scheduler_type}, using OneCycleLR")
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, 
+                max_lr=args.learning_rate * 10,
+                total_steps=args.epochs,
+                pct_start=0.3,
+                div_factor=10.0,
+                final_div_factor=100.0
+            )
     else:
         scheduler = None
     
@@ -447,6 +537,7 @@ def train_ude(args):
         param_group['lr'] = args.learning_rate * 5
 
     losses = []
+    val_losses = []
     force_profile_history = []
     
     print(f"Starting training for {args.epochs} epochs...")
@@ -462,6 +553,7 @@ def train_ude(args):
     print(f"Total steps for loss: {num_steps_loss}, Batch size: {batch_size}, Batches per epoch: {num_batches}")
 
     best_loss = float('inf')
+    best_val_loss = float('inf')
     patience_counter = 0
     zero_force_counter = 0
     
@@ -492,16 +584,22 @@ def train_ude(args):
         force_error = torch.mean((force_x - true_force_x) ** 2).item()
         is_zero_like = max_force < 0.1
         
-        return max_force, mean_force, is_zero_like, force_x.cpu().numpy(), force_error
+        potentials_np = potentials.detach().cpu().numpy()
+        
+        return max_force, mean_force, is_zero_like, force_x.cpu().numpy(), force_error, potentials_np
     
-    initial_max_force, initial_mean_force, _, _, initial_force_error = check_force_profile(nn_model, device)
+    initial_max_force, initial_mean_force, _, _, initial_force_error, initial_potentials = check_force_profile(nn_model, device)
     print(f"Initial force profile: Max={initial_max_force:.4f}, Mean={initial_mean_force:.4f}, Error={initial_force_error:.4f}")
+    
+    train_losses_epoch = []
+    val_losses_epoch = []
     
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         epoch_mse_loss = 0.0
         epoch_symmetry_loss = 0.0
         epoch_force_magnitude_loss = 0.0
+        epoch_smoothness_loss = 0.0
         
         permuted_indices = torch.randperm(num_steps_loss).tolist()
 
@@ -517,6 +615,7 @@ def train_ude(args):
             batch_mse_loss = 0.0
             batch_symmetry_loss = 0.0
             batch_force_magnitude_loss = 0.0
+            batch_smoothness_loss = 0.0
             
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, num_steps_loss)
@@ -534,6 +633,8 @@ def train_ude(args):
                     
                     predicted_accels_norm = predicted_accels_step / accel_scale.to(device)
                     
+                    n_particles = current_positions.shape[0]
+                    total_loss = 0
                     mse_loss_step = F.huber_loss(
                         predicted_accels_norm, 
                         current_target_accel,
@@ -541,9 +642,10 @@ def train_ude(args):
                     )
                     
                     symmetry_loss = 0.0
-                    n_particles = current_positions.shape[0]
-                    
-                    if n_particles > 1 and args.symmetry_weight > 0:
+                    force_magnitude_loss = 0.0
+                    smoothness_loss = 0.0
+
+                    if n_particles > 1:
                         num_pairs = min(5, n_particles * (n_particles - 1) // 2)
                         pair_indices = torch.randperm(n_particles, device=device)[:min(num_pairs * 2, n_particles)]
                         
@@ -555,75 +657,49 @@ def train_ude(args):
                             pos_i = current_positions[i]
                             pos_j = current_positions[j]
                             rel_pos_ij = pos_i - pos_j
-                            rel_pos_ji = pos_j - pos_i
                             
+                            if torch.norm(rel_pos_ij) < 1e-8:
+                                continue
+                                
                             rel_pos_ij.requires_grad_(True)
                             
-                            pot_ij = nn_model.compute_potential(rel_pos_ij.unsqueeze(0)).squeeze(0)
-                            pot_ji = nn_model.compute_potential(rel_pos_ji.unsqueeze(0)).squeeze(0)
-                            
-                            symmetry_loss += F.mse_loss(pot_ij, pot_ji)
-                            
-                            total_pot_ij = pot_ij.sum()
-                            force_ij = -torch.autograd.grad(
-                                total_pot_ij, rel_pos_ij,
-                                create_graph=True, retain_graph=True
-                            )[0]
-                            
-                            direction_ij = rel_pos_ij.detach() / (torch.norm(rel_pos_ij.detach()) + 1e-8)
-                            projection = torch.sum(force_ij * direction_ij)
-                            perpendicular = force_ij - projection * direction_ij
-                            
-                            symmetry_loss += 0.1 * torch.sum(perpendicular**2)
-                        
-                        symmetry_loss /= max(1, num_pairs)
+                            if epoch % 3 == 0:  
+                                r = torch.norm(rel_pos_ij)
+                                if r > 0.2 and r < r_cutoff:  
+                                    true_pot = (g_rep * torch.exp(-m_rho*r) / r - g_att * torch.exp(-m_pi*r) / r)
+                                    pred_pot = nn_model.compute_potential(rel_pos_ij.unsqueeze(0)).squeeze()
+                                    force_magnitude_loss += F.mse_loss(pred_pot, true_pot)
+                                
+                                smoothness_loss_batch = loss_manager.smoothness_loss(nn_model, rel_pos_ij.unsqueeze(0))
+                                smoothness_loss += smoothness_loss_batch
+                                
+                            symmetry_loss_batch = loss_manager.symmetry_loss(nn_model, rel_pos_ij.unsqueeze(0))
+                            symmetry_loss += symmetry_loss_batch
                     
-                    force_magnitude_loss = 0.0
-                    if epoch >= 0:
-                        sample_dists = torch.tensor([0.3, 0.6, 1.0, 2.0, 3.0], device=device)
-                        sample_vectors = torch.zeros((len(sample_dists), 3), device=device)
-                        sample_vectors[:, 0] = sample_dists
-                        
-                        term1 = g_rep * torch.exp(-m_rho*sample_dists) * (m_rho/sample_dists + 1/(sample_dists**2))
-                        term2 = g_att * torch.exp(-m_pi*sample_dists) * (m_pi/sample_dists + 1/(sample_dists**2))
-                        true_force_samples = term1 - term2
-                        
-                        sample_vectors.requires_grad_(True)
-                        
-                        potentials = nn_model.compute_potential(sample_vectors)
-                        total_pot = potentials.sum()
-                        
-                        pred_forces = -torch.autograd.grad(
-                            total_pot, sample_vectors, 
-                            create_graph=True, retain_graph=True
-                        )[0]
-                        
-                        pred_force_magnitudes = pred_forces[:, 0]
-                        
-                        weights = 1.0 / (sample_dists + 0.5)
-                        weights = weights / weights.sum()
-                        force_diff = (pred_force_magnitudes - true_force_samples) ** 2
-                        force_magnitude_loss = torch.sum(weights * force_diff)
-                        
-                        if zero_force_counter > 1:
-                            force_magnitude_loss += 10.0 * torch.mean(torch.exp(-5.0 * torch.abs(pred_force_magnitudes)))
-                    
-                    current_sym_weight = args.symmetry_weight
                     if epoch < args.epochs // 10:
-                        current_sym_weight *= 0.2 
-                    elif epoch > args.epochs * 3 // 4:
-                        current_sym_weight *= 3.0 
-                    
-                    magnitude_weight = 2.0 if zero_force_counter > 1 else 1.0
-                    if epoch < 2:
-                        magnitude_weight *= 0.5
+                        mse_weight = 1.0
+                        symmetry_weight = args.symmetry_weight * 0.2
+                        smoothness_weight = args.smoothness_weight * 0.2
+                        force_magnitude_weight = 0.2
                     elif epoch > args.epochs * 0.8:
-                        magnitude_weight *= 2.0
+                        mse_weight = 0.8
+                        symmetry_weight = args.symmetry_weight * 1.5
+                        smoothness_weight = args.smoothness_weight * 1.5
+                        force_magnitude_weight = 1.5
+                    else:
+                        mse_weight = 1.0
+                        symmetry_weight = args.symmetry_weight
+                        smoothness_weight = args.smoothness_weight
+                        force_magnitude_weight = 1.0
                     
+                    if zero_force_counter > 1:
+                        force_magnitude_weight *= 3.0
+                        
                     combined_loss = (
-                        mse_loss_step + 
-                        current_sym_weight * symmetry_loss +
-                        magnitude_weight * force_magnitude_loss
+                        mse_weight * mse_loss_step + 
+                        symmetry_weight * symmetry_loss / max(1, num_pairs) +
+                        smoothness_weight * smoothness_loss / max(1, num_pairs) +
+                        force_magnitude_weight * force_magnitude_loss / max(1, num_pairs)
                     )
                 
                     step_loss = combined_loss / current_batch_actual_size
@@ -631,6 +707,7 @@ def train_ude(args):
                     
                 batch_mse_loss += mse_loss_step.item()
                 batch_symmetry_loss += symmetry_loss if isinstance(symmetry_loss, float) else symmetry_loss.item()
+                batch_smoothness_loss += smoothness_loss if isinstance(smoothness_loss, float) else smoothness_loss.item()
                 batch_force_magnitude_loss += force_magnitude_loss if isinstance(force_magnitude_loss, float) else force_magnitude_loss.item()
                 batch_loss += combined_loss.item()
                 
@@ -645,6 +722,7 @@ def train_ude(args):
             avg_batch_loss = batch_loss / current_batch_actual_size
             avg_batch_mse = batch_mse_loss / current_batch_actual_size
             avg_batch_sym = batch_symmetry_loss / current_batch_actual_size
+            avg_batch_smooth = batch_smoothness_loss / current_batch_actual_size
             avg_batch_mag = batch_force_magnitude_loss / current_batch_actual_size
             
             if torch.isnan(torch.tensor(avg_batch_loss)) or torch.isinf(torch.tensor(avg_batch_loss)):
@@ -656,6 +734,7 @@ def train_ude(args):
             epoch_loss += batch_loss
             epoch_mse_loss += batch_mse_loss
             epoch_symmetry_loss += batch_symmetry_loss
+            epoch_smoothness_loss += batch_smoothness_loss
             epoch_force_magnitude_loss += batch_force_magnitude_loss
 
             current_lr = optimizer.param_groups[0]['lr']
@@ -663,6 +742,7 @@ def train_ude(args):
                 "Loss": f"{avg_batch_loss:.4e}", 
                 "MSE": f"{avg_batch_mse:.4e}", 
                 "Sym": f"{avg_batch_sym:.4e}",
+                "Smooth": f"{avg_batch_smooth:.4e}",
                 "Mag": f"{avg_batch_mag:.4e}",
                 "LR": f"{current_lr:.3e}",
                 "Mem": f"{torch.cuda.max_memory_allocated() / 1e9:.2f}GB" if torch.cuda.is_available() else "N/A"
@@ -673,6 +753,7 @@ def train_ude(args):
                     "batch/loss": avg_batch_loss,
                     "batch/mse_loss": avg_batch_mse,
                     "batch/symmetry_loss": avg_batch_sym,
+                    "batch/smoothness_loss": avg_batch_smooth,
                     "batch/force_magnitude_loss": avg_batch_mag,
                     "batch/learning_rate": current_lr,
                     "batch/memory_usage_gb": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
@@ -684,13 +765,82 @@ def train_ude(args):
 
         batch_pbar.close()
         
+        nn_model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        
+        with torch.no_grad():
+            for val_idx in val_indices:
+                if val_idx >= len(normalized_positions_for_loss):
+                    continue
+                    
+                val_pos = normalized_positions_for_loss[val_idx].to(device)
+                val_target_accel = normalized_accel[val_idx].to(device)
+                
+                val_pred_accels, _, _ = sim_model.compute_forces(
+                    val_pos * pos_std.to(device) + pos_mean.to(device)
+                )
+                
+                val_pred_accels_norm = val_pred_accels / accel_scale.to(device)
+                
+                val_loss_batch = F.huber_loss(
+                    val_pred_accels_norm, 
+                    val_target_accel,
+                    delta=1.0
+                )
+                
+                val_loss += val_loss_batch.item()
+                val_batches += 1
+                
+                del val_pos, val_target_accel, val_pred_accels, val_pred_accels_norm
+                
+            avg_val_loss = val_loss / max(1, val_batches)
+            
         avg_epoch_loss = epoch_loss / num_steps_loss
         avg_epoch_mse = epoch_mse_loss / num_steps_loss
         avg_epoch_sym = epoch_symmetry_loss / num_steps_loss
+        avg_epoch_smooth = epoch_smoothness_loss / num_steps_loss
         avg_epoch_mag = epoch_force_magnitude_loss / num_steps_loss
 
-        max_force, mean_force, is_zero_like, force_profile, force_error = check_force_profile(nn_model, device)
+        max_force, mean_force, is_zero_like, force_profile, force_error, potentials = check_force_profile(nn_model, device)
         force_profile_history.append(force_profile)
+        
+        train_losses_epoch.append(avg_epoch_loss)
+        val_losses_epoch.append(avg_val_loss)
+        
+        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_epoch_loss:.6f}, Val Loss: {avg_val_loss:.6f}, " 
+              f"MSE: {avg_epoch_mse:.6f}, Sym: {avg_epoch_sym:.6f}, Smooth: {avg_epoch_smooth:.6f}, Mag: {avg_epoch_mag:.6f}, " 
+              f"Force Error: {force_error:.6f}, Max Force: {max_force:.6f}")
+        
+        if args.use_wandb:
+            wandb.log({
+                "epoch/train_loss": avg_epoch_loss,
+                "epoch/val_loss": avg_val_loss,
+                "epoch/mse_loss": avg_epoch_mse,
+                "epoch/symmetry_loss": avg_epoch_sym,
+                "epoch/smoothness_loss": avg_epoch_smooth,
+                "epoch/force_magnitude_loss": avg_epoch_mag,
+                "epoch/force_error": force_error,
+                "epoch/max_force": max_force,
+                "epoch/mean_force": mean_force,
+                "epoch/is_zero_like": int(is_zero_like),
+                "epoch/learning_rate": optimizer.param_groups[0]['lr'],
+                "epoch/force_profile": wandb.plot.line_series(
+                    xs=np.linspace(0.2, 4.0, 40),
+                    ys=[force_profile, 
+                        term1.cpu().numpy() - term2.cpu().numpy()],
+                    keys=["Predicted", "True"],
+                    title="Force Profile",
+                    xname="Distance"
+                ),
+                "epoch/potential_profile": wandb.plot.line_series(
+                    xs=np.linspace(0.2, 4.0, 40),
+                    ys=[potentials],
+                    keys=["Potential"],
+                    title="Potential Profile",
+                    xname="Distance"
+                )
+            })
         
         if is_zero_like:
             zero_force_counter += 1
@@ -705,7 +855,7 @@ def train_ude(args):
                     
                     with torch.no_grad():
                         for name, param in nn_model.named_parameters():
-                            if 'output_layer3.weight' in name:
+                            if 'output_layer3.weight' in name or 'scaling_factor' in name:
                                 param.data *= 10.0
                                 
                     optimizer = optim.AdamW(nn_model.parameters(), 
@@ -713,61 +863,37 @@ def train_ude(args):
                                           weight_decay=args.weight_decay * 0.1,
                                           betas=(0.9, 0.999))
                 else:
-                    print("Re-initializing critical network weights...")
+                    print("No best model found. Reinitializing weights...")
                     with torch.no_grad():
                         for name, param in nn_model.named_parameters():
-                            if 'output_layer3.weight' in name:
-                                param.data *= 5.0
-                
-                zero_force_counter = 0
+                            if 'output_layer3.weight' in name or 'scaling_factor' in name:
+                                param.data *= 10.0
+                    
+                    zero_force_counter = 0
         else:
-            zero_force_counter = max(0, zero_force_counter - 1)
-        
-        if scheduler:
-            scheduler.step()
-
-        losses.append(avg_epoch_loss)
-        
-        print(f"Epoch {epoch+1} - Loss: {avg_epoch_loss:.4e}, MSE: {avg_epoch_mse:.4e}, Sym: {avg_epoch_sym:.4e}, Mag: {avg_epoch_mag:.4e}, MaxForce: {max_force:.4e}, ForceError: {force_error:.4e}, LR: {current_lr:.3e}")
-
-        if args.use_wandb:
-            wandb.log({
-                "epoch": epoch + 1,
-                "train/loss": avg_epoch_loss,
-                "train/mse_loss": avg_epoch_mse,
-                "train/symmetry_loss": avg_epoch_sym,
-                "train/force_magnitude_loss": avg_epoch_mag,
-                "train/learning_rate": current_lr,
-                "train/patience_counter": patience_counter,
-                "train/max_force": max_force,
-                "train/mean_force": mean_force,
-                "train/is_zero_solution": is_zero_like,
-                "train/force_error": force_error,
-                "train/time_elapsed": time.time() - start_time
-            })
-
-        combined_metric = avg_epoch_loss + 10.0 * force_error
-        if combined_metric < best_loss:
-            best_loss = combined_metric
+            zero_force_counter = 0
+                
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             patience_counter = 0
-            best_model_path = args.model_save_path.replace('.pt', '_best.pt')
-            print(f"New best model! Saving to {best_model_path}")
-            torch.save(nn_model.state_dict(), best_model_path)
+            print(f"New best validation loss: {best_val_loss:.6f}. Saving model...")
+            torch.save(nn_model.state_dict(), args.model_save_path.replace('.pt', '_best.pt'))
+            
+            if force_error < best_loss:
+                best_loss = force_error
+                print(f"New best force error: {best_loss:.6f}. Saving model...")
+                torch.save(nn_model.state_dict(), args.model_save_path)
         else:
             patience_counter += 1
-            if args.patience > 0 and patience_counter >= args.patience:
-                print(f"Early stopping triggered after {epoch+1} epochs (no improvement for {args.patience} epochs)")
+            if patience_counter >= args.patience:
+                print(f"Early stopping after {args.patience} epochs without improvement")
                 break
-
-        if args.checkpoint_interval > 0 and (epoch + 1) % args.checkpoint_interval == 0:
-            checkpoint_dir = os.path.dirname(args.model_save_path)
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            base, ext = os.path.splitext(args.model_save_path)
-            checkpoint_path = f"{base}_epoch{epoch+1}{ext}"
-            print(f"\nSaving checkpoint to {checkpoint_path}...")
-            torch.save(nn_model.state_dict(), checkpoint_path)
-        
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+        if args.use_scheduler:
+            if args.scheduler_type == 'reduce_on_plateau':
+                scheduler.step(avg_val_loss)
+            else:
+                scheduler.step()
 
     print("Training complete.")
     
@@ -775,18 +901,18 @@ def train_ude(args):
     torch.save(nn_model.state_dict(), args.model_save_path)
 
     if best_loss < avg_epoch_loss:
-        print(f"Loading best model from {best_model_path}...")
-        nn_model.load_state_dict(torch.load(best_model_path))
+        print(f"Loading best model from {args.model_save_path}...")
+        nn_model.load_state_dict(torch.load(args.model_save_path))
 
     plot_loss_path = os.path.join(output_dir, "ude_training_loss.png")
     print(f"Saving training loss plot to {plot_loss_path}...")
     plt.figure(figsize=(10, 6))
-    plt.plot(losses)
+    plt.plot(train_losses_epoch, label="Training Loss")
+    plt.plot(val_losses_epoch, label="Validation Loss")
     plt.xlabel("Epoch")
-    plt.ylabel("Loss (Combined)")
-    plt.title("UDE Training Loss (Physics-Informed MLP)")
-    plt.yscale('log')
-    plt.grid(True)
+    plt.ylabel("Loss")
+    plt.title("UDE Training and Validation Loss")
+    plt.legend()
     plt.savefig(plot_loss_path)
     plt.close()
     
@@ -832,7 +958,7 @@ def train_ude(args):
         wandb.log({
             "train/final_loss": avg_epoch_loss,
             "train/best_loss": best_loss,
-            "train/total_epochs": epoch + 1,
+            "train/total_epochs": args.epochs,
             "train/training_time": time.time() - start_time,
             "train/loss_plot": wandb.Image(plot_loss_path),
             "train/force_profile_evolution": wandb.Image(plot_force_evolution_path)
@@ -1120,102 +1246,68 @@ def analyze_results(args):
         wandb.finish()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the full UDE pipeline: Data Generation -> Training -> Analysis")
-
-    parser.add_argument('--data_file', type=str, default="data/training_data.pt", help='Path to save/load the training data file.')
-    parser.add_argument('--model_save_path', type=str, default="ude_output/ude_potential_mlp.pt", help='Path to save the trained UDE MLP model.')
-    parser.add_argument('--model_load_path', type=str, default="ude_output/ude_potential_mlp.pt", help='Path to load the trained UDE MLP model for analysis.')
-    parser.add_argument('--analysis_output_dir', type=str, default="ude_output", help='Directory to save analysis plots.')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use (cuda or cpu).')
-    parser.add_argument('--skip_data_gen', action='store_true', help='Skip data generation if data file exists.')
-    parser.add_argument('--skip_training', action='store_true', help='Skip training if model file exists.')
-    parser.add_argument('--skip_analysis', action='store_true', help='Skip the final analysis step.')
-    
-    parser.add_argument('--use_wandb', action='store_true', help='Enable logging with Weights & Biases.')
-    parser.add_argument('--wandb_project', type=str, default='ude-nuclear', help='W&B project name.')
-    parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity name.')
-    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name. If not provided, will be auto-generated.')
-    parser.add_argument('--wandb_tags', nargs='+', default=[], help='Tags for the W&B run.')
-
-    parser.add_argument('--num_collisions', type=int, default=20, help='Number of collisions to simulate for data generation.')
-    parser.add_argument('--max_impact_parameter', type=float, default=3.0, help='Maximum impact parameter for collisions.')
-    parser.add_argument('--g_att', type=float, default=13.5, help='Attractive potential strength.')
-    parser.add_argument('--g_rep', type=float, default=20.0, help='Repulsive potential strength.')
-    parser.add_argument('--m_pi', type=float, default=0.70, help='Pion mass (range parameter).')
-    parser.add_argument('--m_rho', type=float, default=3.93, help='Rho meson mass (range parameter).')
-    parser.add_argument('--r_cutoff', type=float, default=5.0, help='Potential cutoff radius.')
-    parser.add_argument('--r_core', type=float, default=0.3, help='Potential core radius.')
-    parser.add_argument('--t_end', type=float, default=1.0, help='Simulation end time.')
-    parser.add_argument('--dt_min', type=float, default=1e-16, help='Minimum adaptive timestep.')
-    parser.add_argument('--tau_max', type=float, default=0.01, help='Maximum error tolerance for adaptive timestep.')
-    parser.add_argument('--Imax', type=float, default=0.1, help='Maximum impulse for adaptive timestep.')
-    parser.add_argument('--n_particles', type=int, default=20, help='Total number of particles in simulation.')
-    parser.add_argument('--relative_velocity', type=float, default=20.0, help='Initial relative velocity of nuclei.')
-    parser.add_argument('--random_velocity', type=float, default=1.0, help='Magnitude of initial random velocities.')
-    parser.add_argument('--radius', type=float, default=0.8, help='Radius for initial particle distribution.')
-    parser.add_argument('--save_interval', type=int, default=1, help='Simulation save interval.')
-    parser.add_argument('--dt_initial', type=float, default=0.001, help='Initial timestep for simulation.')
-    parser.add_argument('--max_steps', type=int, default=500, help='Maximum simulation steps.')
-    parser.add_argument('--noise_level', type=float, default=1e-3, help='Noise level to add to generated data (reduced for better training).')
-
-    parser.add_argument('--learning_rate', type=float, default=5e-4, help='Optimizer learning rate.')
-    parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs.')
-    parser.add_argument('--nn_hidden_dim', type=int, default=128, help='Hidden dimension size for the PotentialNN (increased).')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for time steps during training (reduced).')
-    parser.add_argument('--use_scheduler', action='store_true', help='Use learning rate scheduler.')
-    parser.add_argument('--checkpoint_interval', type=int, default=10, help='Save checkpoint every N epochs (10 to enable).')
-    parser.add_argument('--clip_grad', type=float, default=1.0, help='Max gradient norm for clipping (enabled by default).')
-    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for optimizer (increased for stability).')
-    parser.add_argument('--num_residual_blocks', type=int, default=3, help='Number of residual blocks in the PotentialNN (increased).')
-    parser.add_argument('--symmetry_weight', type=float, default=0.2, help='Weight for symmetry loss in the physics-informed loss function.')
+    parser = argparse.ArgumentParser(description='Universal Differential Equation (UDE) for nucleon simulation')
+    parser.add_argument('--mode', type=str, required=True, choices=['generate_data', 'train_ude', 'analyze_results'], help='Program operation mode')
+    parser.add_argument('--model_save_path', type=str, default='./models/ude_model.pt', help='Path to save/load the trained model')
+    parser.add_argument('--data_file', type=str, default='./data/ude_data.pt', help='Path to save/load the generated data')
+    parser.add_argument('--g_att', type=float, default=7.0, help='Attractive coupling constant')
+    parser.add_argument('--g_rep', type=float, default=10.0, help='Repulsive coupling constant')
+    parser.add_argument('--m_pi', type=float, default=0.7, help='Pion mass parameter')
+    parser.add_argument('--m_rho', type=float, default=3.5, help='Rho mass parameter')
+    parser.add_argument('--r_cutoff', type=float, default=5.0, help='Cutoff radius for potential')
+    parser.add_argument('--r_core', type=float, default=0.5, help='Repulsive core radius')
+    parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate for NN training')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for regularization')
+    parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping value')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training. Set to 0 for auto-determination.')
+    parser.add_argument('--nn_hidden_dim', type=int, default=256, help='Hidden dimension of the neural network')
+    parser.add_argument('--num_residual_blocks', type=int, default=4, help='Number of residual blocks in the neural network')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to run on')
+    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='physics-ude', help='Weights & Biases project name')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity name')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='Custom name for the W&B run')
+    parser.add_argument('--wandb_tags', type=str, nargs='+', default=[], help='Tags for wandb run')
+    parser.add_argument('--use_scheduler', action='store_true', help='Use learning rate scheduler')
+    parser.add_argument('--n_particles', type=int, default=4, help='Number of particles in the simulation')
+    parser.add_argument('--relative_velocity', type=float, default=1.0, help='Relative velocity of the nuclei in the x direction')
+    parser.add_argument('--random_velocity', type=float, default=0.1, help='Random velocity components')
+    parser.add_argument('--radius', type=float, default=1.5, help='Nucleus radius')
+    parser.add_argument('--t_end', type=float, default=15.0, help='End time of the simulation')
+    parser.add_argument('--dt_min', type=float, default=1e-16, help='Minimum time step in the adaptive scheme')
+    parser.add_argument('--tau_max', type=float, default=0.01, help='Maximum difference in the RKQ4 error control')
+    parser.add_argument('--Imax', type=float, default=0.1, help='Safety factor in the adaptive time step')
+    parser.add_argument('--num_collisions', type=int, default=1, help='Number of collision simulations for data generation')
+    parser.add_argument('--max_impact_parameter', type=float, default=3.0, help='Maximum impact parameter for collisions (actual value sampled stochastically)')
+    parser.add_argument('--noise_level', type=float, default=0.02, help='Level of Gaussian noise to add to the data')
+    parser.add_argument('--save_interval', type=int, default=10, help='Interval for saving simulation data')
+    parser.add_argument('--dt_initial', type=float, default=0.001, help='Initial time step')
+    parser.add_argument('--max_steps', type=int, default=20000, help='Maximum number of simulation steps')
+    parser.add_argument('--checkpoint_interval', type=int, default=10, help='Save model checkpoints every N epochs. Set to 0 to disable.')
+    parser.add_argument('--symmetry_weight', type=float, default=0.5, help='Weight for symmetry loss component')
     parser.add_argument('--patience', type=int, default=15, help='Patience for early stopping (increased).')
     parser.add_argument('--max_potential', type=float, default=50.0, help='Maximum potential value for scaling in the PotentialNN model (reduced).')
-
+    parser.add_argument('--model_type', type=str, default='potential_nn', choices=['potential_nn', 'kan'], help='Type of neural network model to use.')
+    parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout rate for the PotentialNN model.')
+    parser.add_argument('--smoothness_weight', type=float, default=0.1, help='Weight for smoothness loss in the physics-informed loss function.')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'adam', 'sgd'], help='Optimizer to use.')
+    parser.add_argument('--scheduler_type', type=str, default='one_cycle', choices=['one_cycle', 'cosine', 'reduce_on_plateau'], help='Scheduler type to use.')
+    parser.add_argument('--plot_results', action='store_true', help='Create plots of results')
+    parser.add_argument('--prediction_steps', type=int, default=500, help='Number of steps for prediction trajectory')
+    parser.add_argument('--use_true_potential', action='store_true', help='Use the true potential for analysis comparison')
+    
     args = parser.parse_args()
 
-    overall_start_time = time.time()
-    
     if args.use_wandb:
-        os.environ["WANDB_SILENT"] = "true"
-        print(f"Weights & Biases logging enabled. Project: {args.wandb_project}")
-        print(f"Note: Using enhanced PotentialNN model that predicts scalar potential rather than forces directly.")
-        print(f"      Forces are computed as the gradient of the potential, ensuring conservation laws.")
-    
-    if not args.skip_data_gen or not os.path.exists(args.data_file):
-        if not args.skip_data_gen and os.path.exists(args.data_file):
-             print(f"Data file {args.data_file} exists, but --skip_data_gen not specified. Regenerating data.")
+        import wandb
+        wandb.login()
+
+    if args.mode == 'generate_data':
         generate_data(args)
-    else:
-        print(f"Skipping data generation, using existing file: {args.data_file}")
-
-    if not args.skip_training or not os.path.exists(args.model_save_path):
-        if not args.skip_training and os.path.exists(args.model_save_path):
-            print(f"Model file {args.model_save_path} exists, but --skip_training not specified. Retraining model.")
+    elif args.mode == 'train_ude':
         train_ude(args)
-    else:
-         print(f"Skipping training, using existing model: {args.model_save_path}")
-
-    if not args.skip_analysis:
+    elif args.mode == 'analyze_results':
         analyze_results(args)
     else:
-        print("Skipping analysis.")
-
-    overall_end_time = time.time()
-    total_runtime = overall_end_time - overall_start_time
-    print(f"\n--- Pipeline Finished ({total_runtime:.2f}s) ---")
-    
-    if args.use_wandb:
-        with wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_run_name or f"pipeline-summary", 
-            config=vars(args),
-            tags=args.wandb_tags + ["pipeline_summary"],
-            resume="allow"
-        ) as run:
-            wandb.summary["total_runtime"] = total_runtime
-            wandb.summary["data_file"] = args.data_file
-            wandb.summary["model_file"] = args.model_save_path
-            wandb.summary["skipped_data_gen"] = args.skip_data_gen
-            wandb.summary["skipped_training"] = args.skip_training
-            wandb.summary["skipped_analysis"] = args.skip_analysis
+        print(f"Unknown mode: {args.mode}")
