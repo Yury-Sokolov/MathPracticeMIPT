@@ -194,11 +194,16 @@ class KANPotentialModel(nn.Module):
             nn.SiLU()
         )
         
+        width_list = [hidden_dim]
+        for _ in range(num_layers):
+            width_list.append(hidden_dim)
+        width_list.append(1)
+        
         self.kan = KAN(
-            width=hidden_dim,
-            grid=10,                 
-            k=3,                     
-            mult_arity=num_layers,   
+            width=width_list,
+            grid=10,
+            k=3,
+            mult_arity=num_layers,
             noise_scale=0.2,
             scale_base_mu=0.0,
             scale_base_sigma=1.0,
