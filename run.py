@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import os
 import sys
@@ -10,12 +9,9 @@ import argparse
 import time
 import wandb
 import torch.nn.functional as F
-from pathlib import Path
 from sklearn.model_selection import train_test_split
 
-from ude.ude_network import PotentialNN, KANPotentialModel, LossManager
-from potential.potential import MesonExchangePotential
-from core.simulation import Simulation
+from ude.ude_network import KANPotentialModel, LossManager
 
 try:
     from core import Simulation
@@ -414,7 +410,7 @@ def train_ude(args):
     init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
     
     print("Pre-training neural network...")
-    for pre_epoch in tqdm(range(300), desc="Pre-training"):
+    for pre_epoch in tqdm(range(3), desc="Pre-training"):
         init_optimizer.zero_grad()
         
         with torch.enable_grad():
