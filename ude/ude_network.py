@@ -185,34 +185,65 @@ class KANPotentialModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.grid_size = 16
         
-        self.kan_network = kan.MultKAN(
-            3,
-            [hidden_dim] * num_layers + [1],
-            grid=self.grid_size,
-            name="potential_kan",
-            init_sparsity=0.5,
-            activation="softsign"
-        )
+        try:
+            width_list = [3] + [hidden_dim] * num_layers + [1]
+            
+            self.kan_network = kan.MultKAN(
+                width_list=width_list,
+                grid=self.grid_size,
+                name="potential_kan",
+                activation="softsign",
+                init_sparsity=0.5
+            )
+        except TypeError as e:
+            print(f"MultKAN инициализация не удалась, пробуем альтернативную сигнатуру: {e}")
+            self.kan_network = kan.MultKAN(
+                width_list, 
+                grid=self.grid_size,
+                name="potential_kan",
+                activation="softsign"
+            )
         
         self.scaling_factor = nn.Parameter(torch.ones(1) * 0.1)
     
     def compute_potential(self, r_vectors):
         """Calculate potential energy using KAN"""
+        is_batched = len(r_vectors.shape) > 1
+        if not is_batched:
+            r_vectors = r_vectors.unsqueeze(0) 
         r_norm = torch.norm(r_vectors, dim=1, keepdim=True)
         
         safe_r_norm = torch.clamp(r_norm, min=1e-6)
         normalized_r = r_vectors / safe_r_norm
         
-        r_scaled = torch.clamp(r_norm / 5.0, 0.0, 1.0)
+        r_scaled = torch.clamp(r_norm / 5.0, 0.0, 1.0) 
         kan_input = torch.cat([r_scaled, normalized_r], dim=1)
         
-        potential_raw = self.kan_network(kan_input)
+        if kan_input.shape[0] == 1:
+            potential_raw = self.kan_network(kan_input)
+        else:
+
+            potential_parts = []
+            batch_size = 4 
+            
+            for i in range(0, kan_input.shape[0], batch_size):
+                batch_input = kan_input[i:i+batch_size]
+                batch_output = self.kan_network(batch_input)
+                potential_parts.append(batch_output)
+            
+            if potential_parts:
+                potential_raw = torch.cat(potential_parts, dim=0)
+            else:
+                potential_raw = self.kan_network(kan_input)
 
         potential = torch.tanh(potential_raw) * torch.abs(self.scaling_factor) * self.max_potential
         
         decaying_factor = 1.0 / (1.0 + safe_r_norm)
         scaled_potential = potential * decaying_factor
         
+        if not is_batched:
+            scaled_potential = scaled_potential.squeeze(0)
+            
         return scaled_potential.squeeze(-1)
     
     def compute_force(self, r_vectors):

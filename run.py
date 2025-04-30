@@ -1140,7 +1140,7 @@ def analyze_results(args):
         run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
-            name=args.wandb_run_name or f"analyze-ude-{os.path.basename(args.model_load_path)}", 
+            name=args.wandb_run_name or f"analyze-ude-{os.path.basename(args.model_load_path or args.model_save_path)}", 
             config=wandb_config,
             tags=args.wandb_tags + ["analysis"],
             resume="allow"
@@ -1151,8 +1151,10 @@ def analyze_results(args):
 
     if not os.path.exists(args.data_file):
         raise FileNotFoundError(f"Data file not found: {args.data_file}")
-    if not os.path.exists(args.model_load_path):
-         raise FileNotFoundError(f"Model file not found: {args.model_load_path}. Run training first.")
+    
+    model_path = args.model_load_path if args.model_load_path else args.model_save_path
+    if not os.path.exists(model_path):
+         raise FileNotFoundError(f"Model file not found: {model_path}. Run training first.")
 
     print(f"Loading data from {args.data_file}...")
     data = torch.load(args.data_file, map_location='cpu')
@@ -1171,7 +1173,7 @@ def analyze_results(args):
     potential_params_loaded['device'] = device
     print("Data loaded.")
 
-    print(f"Loading trained MLP model from {args.model_load_path}...")
+    print(f"Loading trained MLP model from {model_path}...")
     print("Instantiating MLP model for loading.")
     nn_model = PotentialNN(
         hidden_dim=args.nn_hidden_dim,
@@ -1180,7 +1182,7 @@ def analyze_results(args):
     ).to(device)
 
     try:
-        nn_model.load_state_dict(torch.load(args.model_load_path, map_location=device))
+        nn_model.load_state_dict(torch.load(model_path, map_location=device))
     except Exception as e:
         print(f"Error loading model state_dict: {e}")
         print(f"Ensure the --nn_hidden_dim used for analysis matches the saved model.")
