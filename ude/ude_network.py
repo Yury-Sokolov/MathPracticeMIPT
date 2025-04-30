@@ -151,7 +151,7 @@ class PotentialNN(nn.Module):
         
         potential = self.compute_potential(r_vectors_grad)
         
-        total_potential = torch.sum(potential)
+        total_potential = torch.sum(potential.contiguous())
         
         forces = -torch.autograd.grad(
             total_potential, r_vectors_grad, 
@@ -244,7 +244,7 @@ class KANPotentialModel(nn.Module):
         r_vectors_grad = r_vectors.clone().requires_grad_(True)
         
         potential = self.compute_potential(r_vectors_grad)
-        total_potential = torch.sum(potential)
+        total_potential = torch.sum(potential.contiguous())
         
         forces = -torch.autograd.grad(
             total_potential, r_vectors_grad, 
