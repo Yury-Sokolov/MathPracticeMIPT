@@ -11,17 +11,15 @@ import wandb
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 
-from ude.ude_network import KANPotentialModel, LossManager
-
 try:
+    from ude.ude_network import KANPotentialModel, LossManager, PotentialNN
     from core import Simulation
     from potential import MesonExchangePotential
-    from ude.ude_network import PotentialNN
 except ImportError:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from ude.ude_network import KANPotentialModel, LossManager, PotentialNN
     from core import Simulation
     from potential import MesonExchangePotential
-    from ude.ude_network import PotentialNN
 
 def generate_data(args):
     print("\n--- Starting Data Generation ---")
@@ -351,14 +349,29 @@ def train_ude(args):
                 num_layers=args.num_residual_blocks,
                 max_potential=args.max_potential
             ).to(device)
-        except ImportError:
-            print("Error: KAN model requires pykan library. Falling back to PotentialNN")
+            
+            init_model = KANPotentialModel(
+                hidden_dim=args.nn_hidden_dim,
+                num_layers=args.num_residual_blocks,
+                max_potential=args.max_potential
+            ).to(device)
+        except ImportError as e:
+            print(f"Error: KAN model requires pykan library. Falling back to PotentialNN: {e}")
             nn_model = PotentialNN(
                 hidden_dim=args.nn_hidden_dim, 
                 num_blocks=args.num_residual_blocks,
                 max_potential=args.max_potential,
                 dropout_rate=args.dropout_rate
             ).to(device)
+            
+            init_model = PotentialNN(
+                hidden_dim=args.nn_hidden_dim,
+                num_blocks=args.num_residual_blocks,
+                max_potential=args.max_potential,
+                dropout_rate=args.dropout_rate
+            ).to(device)
+            
+            args.model_type = 'potential_nn'
     else:
         raise ValueError(f"Unknown model type: {args.model_type}")
 
@@ -394,20 +407,6 @@ def train_ude(args):
     true_forces = torch.zeros_like(test_vectors)
     true_forces[:, 0] = true_force_magnitudes
     
-    if isinstance(nn_model, KANPotentialModel):
-        init_model = KANPotentialModel(
-            hidden_dim=args.nn_hidden_dim, 
-            num_layers=args.num_residual_blocks,
-            max_potential=args.max_potential
-        ).to(device)
-    else:
-        init_model = PotentialNN(
-            hidden_dim=args.nn_hidden_dim,
-            num_blocks=args.num_residual_blocks,
-            max_potential=args.max_potential,
-            dropout_rate=args.dropout_rate
-        ).to(device)
-    
     init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
     
     print("Pre-training neural network...")
@@ -417,7 +416,7 @@ def train_ude(args):
         with torch.enable_grad():
             test_vectors_clone = test_vectors.clone().requires_grad_(True)
             
-            if isinstance(init_model, KANPotentialModel):
+            if args.model_type == 'kan':
                 mini_batch_size = 4
                 total_pot_loss = 0
                 total_force_loss = 0
@@ -498,11 +497,11 @@ def train_ude(args):
         torch.nn.utils.clip_grad_norm_(init_model.parameters(), 1.0)
         init_optimizer.step()
         
-        if isinstance(init_model, KANPotentialModel) and pre_epoch == 0:
+        if args.model_type == 'kan':
             print(f"  Pre-train epoch {pre_epoch+1}: Pot Loss={total_pot_loss:.6f}, Force Loss={total_force_loss:.6f}")
     
     with torch.no_grad():
-        if isinstance(init_model, KANPotentialModel):
+        if args.model_type == 'kan':
             pred_potentials = []
             batch_size = 8
             for i in range(0, len(test_vectors), batch_size):
@@ -605,7 +604,8 @@ def train_ude(args):
         param_group['initial_lr'] = args.learning_rate
         param_group['lr'] = args.learning_rate * 5
 
-
+    losses = []
+    val_losses = []
     force_profile_history = []
     
     print(f"Starting training for {args.epochs} epochs...")
@@ -633,7 +633,7 @@ def train_ude(args):
         test_vectors[:, 0] = distances
         test_vectors.requires_grad_(True)
         
-        if isinstance(model, KANPotentialModel):
+        if args.model_type == 'kan':
             potentials = []
             batch_size = 4
             for i in range(0, len(distances), batch_size):
@@ -646,9 +646,11 @@ def train_ude(args):
             for i, vec in enumerate(test_vectors):
                 vec_single = vec.unsqueeze(0).clone().requires_grad_(True)
                 pot_single = model.compute_potential(vec_single)
-                grad = torch.autograd.grad(pot_single, vec_single, 
-                                          create_graph=False, retain_graph=False)[0]
-                force_x.append(-grad[0, 0].item()) 
+                grad = torch.autograd.grad(
+                    pot_single, vec_single, 
+                    create_graph=False, retain_graph=False
+                )[0]
+                force_x.append(-grad[0, 0].item())
             force_x = torch.tensor(force_x, device=device)
         else:
             potentials = model.compute_potential(test_vectors)

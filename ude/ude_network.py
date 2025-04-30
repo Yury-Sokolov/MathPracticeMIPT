@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 try:
-    from kan import KAN
+    import kan
 except ImportError:
     print("Warning: pykan not installed. KAN models will not be available.")
-    KAN = None
+    kan = None
 
 class ScaleSILU(nn.Module):
     """Scaled SiLU activation for better gradient flow"""
@@ -178,53 +178,42 @@ class KANPotentialModel(nn.Module):
     def __init__(self, hidden_dim=64, num_layers=3, max_potential=100.0):
         super().__init__()
         
-        if KAN is None:
+        if kan is None:
             raise ImportError("pykan is not installed. Please install with: pip install pykan")
             
         self.max_potential = max_potential
         self.hidden_dim = hidden_dim
+        self.grid_size = 16
         
-        self.distance_embedding = nn.Sequential(
-            nn.Linear(1, hidden_dim // 2),
-            nn.SiLU()
+        self.kan_network = kan.nn.MultKAN(
+            3,
+            [hidden_dim] * num_layers + [1],
+            grid=self.grid_size,
+            name="potential_kan",
+            init_sparsity=0.5,
+            activation="softsign"
         )
         
-        self.direction_embedding = nn.Sequential(
-            nn.Linear(3, hidden_dim // 2),
-            nn.SiLU()
-        )
-        
-        width_list = [hidden_dim]
-        for _ in range(num_layers):
-            width_list.append(hidden_dim)
-        width_list.append(1)
-        
-        self.kan = KAN(
-            width=width_list,
-            device='cuda' if torch.cuda.is_available() else 'cpu'
-        )
-        
-        self.scaling_factor = nn.Parameter(torch.ones(1))
-        self.r_cutoff = nn.Parameter(torch.tensor(5.0))
+        self.scaling_factor = nn.Parameter(torch.ones(1) * 0.1)
     
     def compute_potential(self, r_vectors):
         """Calculate potential energy using KAN"""
-        distances = torch.norm(r_vectors, dim=-1, keepdim=True)
-        directions = r_vectors / (distances + 1e-6)
+        r_norm = torch.norm(r_vectors, dim=1, keepdim=True)
         
-        d_embedding = self.distance_embedding(distances)
-        dir_embedding = self.direction_embedding(directions)
+        safe_r_norm = torch.clamp(r_norm, min=1e-6)
+        normalized_r = r_vectors / safe_r_norm
         
-        features = torch.cat([d_embedding, dir_embedding], dim=-1)
+        r_scaled = torch.clamp(r_norm / 5.0, 0.0, 1.0)
+        kan_input = torch.cat([r_scaled, normalized_r], dim=1)
         
-        potential_raw = self.kan(features)
+        potential_raw = self.kan_network(kan_input)
+
+        potential = torch.tanh(potential_raw) * torch.abs(self.scaling_factor) * self.max_potential
         
-        inverse_distances = 1.0 / (distances + 1e-6)
-        scaled_potential = self.scaling_factor * potential_raw * inverse_distances
+        decaying_factor = 1.0 / (1.0 + safe_r_norm)
+        scaled_potential = potential * decaying_factor
         
-        cutoff_factor = torch.exp(-(distances / self.r_cutoff)**2)
-        
-        return scaled_potential.squeeze(-1) * cutoff_factor.squeeze(-1)
+        return scaled_potential.squeeze(-1)
     
     def compute_force(self, r_vectors):
         """Compute forces from potential using automatic differentiation"""
@@ -241,7 +230,7 @@ class KANPotentialModel(nn.Module):
         return forces
     
     def forward(self, r_vectors):
-        """Forward pass returns forces"""
+        """Forward pass computing forces from distance vectors"""
         return self.compute_force(r_vectors)
 
 
