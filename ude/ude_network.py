@@ -187,22 +187,25 @@ class KANPotentialModel(nn.Module):
         
         try:
             width_list = [3] + [hidden_dim] * num_layers + [1]
+            self.kan_network = kan.MultKAN(width_list, self.grid_size)
+            print(f"KAN успешно инициализирован с размерностями: {width_list}")
+        except Exception as e:
+            print(f"Ошибка инициализации KAN: {e}")
+            print(f"Пробуем альтернативную инициализацию...")
             
-            self.kan_network = kan.MultKAN(
-                width_list=width_list,
-                grid=self.grid_size,
-                name="potential_kan",
-                activation="softsign",
-                init_sparsity=0.5
-            )
-        except TypeError as e:
-            print(f"MultKAN инициализация не удалась, пробуем альтернативную сигнатуру: {e}")
-            self.kan_network = kan.MultKAN(
-                width_list, 
-                grid=self.grid_size,
-                name="potential_kan",
-                activation="softsign"
-            )
+            try:
+                self.kan_network = kan.KAN(
+                    [3, hidden_dim, hidden_dim, hidden_dim, 1], 
+                    grid=self.grid_size
+                )
+                print("Успешно инициализирован KAN")
+            except Exception as e2:
+                print(f"Вторая попытка инициализации KAN также не удалась: {e2}")
+                print("Используем очень простую инициализацию...")
+                
+                args = dir(kan.MultKAN.__init__)
+                print(f"Доступные аргументы KAN: {args}")
+                self.kan_network = kan.MultKAN([3, hidden_dim, 1], 10)
         
         self.scaling_factor = nn.Parameter(torch.ones(1) * 0.1)
     

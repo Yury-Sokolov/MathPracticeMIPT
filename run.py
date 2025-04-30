@@ -1125,6 +1125,11 @@ def analyze_results(args):
     start_time = time.time()
     output_dir = args.analysis_output_dir if hasattr(args, 'analysis_output_dir') else os.path.dirname(args.model_save_path)
     os.makedirs(output_dir, exist_ok=True)
+    
+    model_dir = os.path.dirname(args.model_save_path)
+    if model_dir:
+        os.makedirs(model_dir, exist_ok=True)
+    
     plot_trajectory_path = os.path.join(output_dir, "ude_trajectory_comparison.png")
     plot_force_path = os.path.join(output_dir, "ude_force_comparison.png")
     plot_potential_path = os.path.join(output_dir, "ude_potential_comparison.png")
@@ -1154,7 +1159,13 @@ def analyze_results(args):
     
     model_path = args.model_load_path if args.model_load_path else args.model_save_path
     if not os.path.exists(model_path):
-         raise FileNotFoundError(f"Model file not found: {model_path}. Run training first.")
+        print(f"Модель не найдена: {model_path}")
+        if args.mode == "analyze_results":
+            print("Пожалуйста, сначала запустите обучение модели или укажите правильный путь.")
+            return
+        else:
+            print("Режим анализа будет пропущен, т.к. модель еще не обучена.")
+            return
 
     print(f"Loading data from {args.data_file}...")
     data = torch.load(args.data_file, map_location='cpu')
