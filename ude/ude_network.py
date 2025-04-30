@@ -222,22 +222,7 @@ class KANPotentialModel(nn.Module):
         r_scaled = torch.clamp(r_norm / 5.0, 0.0, 1.0) 
         kan_input = torch.cat([r_scaled, normalized_r], dim=1)
         
-        if kan_input.shape[0] == 1:
-            potential_raw = self.kan_network(kan_input)
-        else:
-
-            potential_parts = []
-            batch_size = 4 
-            
-            for i in range(0, kan_input.shape[0], batch_size):
-                batch_input = kan_input[i:i+batch_size]
-                batch_output = self.kan_network(batch_input)
-                potential_parts.append(batch_output)
-            
-            if potential_parts:
-                potential_raw = torch.cat(potential_parts, dim=0)
-            else:
-                potential_raw = self.kan_network(kan_input)
+        potential_raw = self.kan_network(kan_input)
 
         potential = torch.tanh(potential_raw) * torch.abs(self.scaling_factor) * self.max_potential
         

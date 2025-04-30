@@ -417,56 +417,37 @@ def train_ude(args):
             test_vectors_clone = test_vectors.clone().requires_grad_(True)
             
             if args.model_type == 'kan':
-                mini_batch_size = 4
-                total_pot_loss = 0
-                total_force_loss = 0
+                pred_potentials = init_model.compute_potential(test_vectors_clone)
+                pred_min = torch.min(pred_potentials)
+                pred_potentials = pred_potentials - pred_min
                 
-                for i in range(0, len(test_vectors), mini_batch_size):
-                    batch_vectors = test_vectors_clone[i:i+mini_batch_size].clone().requires_grad_(True)
+                max_true = torch.max(true_potential_values)
+                max_pred = torch.max(pred_potentials.detach())
+                
+                if max_pred > 1e-6:
+                    pred_scale = max_true / max_pred
+                else:
+                    pred_scale = 1.0
                     
-                    pred_potentials_batch = init_model.compute_potential(batch_vectors)
-                    pred_min_batch = torch.min(pred_potentials_batch)
-                    pred_potentials_batch = pred_potentials_batch - pred_min_batch
-                    
-                    batch_indices = slice(i, min(i+mini_batch_size, len(test_vectors)))
-                    true_values_batch = true_potential_values[batch_indices]
-                    
-                    max_true = torch.max(true_values_batch)
-                    max_pred = torch.max(pred_potentials_batch.detach())
-                    if max_pred > 1e-6:
-                        pred_scale_batch = max_true / max_pred
-                    else:
-                        pred_scale_batch = 1.0
-                        
-                    pred_potentials_scaled_batch = pred_potentials_batch * pred_scale_batch
-                    pot_loss_batch = F.mse_loss(pred_potentials_scaled_batch, true_values_batch)
-                    
-                    force_loss_batch = 0
-                    for j in range(len(batch_vectors)):
-                        vec_idx = i + j
-                        if vec_idx >= len(test_vectors):
-                            break
-                            
-                        vec_single = batch_vectors[j].unsqueeze(0).clone().requires_grad_(True)
-                        pot_single = init_model.compute_potential(vec_single) * pred_scale_batch
-                        grad = torch.autograd.grad(
-                            pot_single, vec_single, 
-                            create_graph=True, retain_graph=True
-                        )[0]
-                        
-                        true_force_single = true_forces[vec_idx].unsqueeze(0)
-                        weight = 1.0 / (test_dists[vec_idx].detach() + 0.5)
-                        force_diff = torch.sum((-grad - true_force_single) ** 2) * weight
-                        force_loss_batch += force_diff
-                    
-                    batch_loss = pot_loss_batch + 5.0 * force_loss_batch / len(batch_vectors)
-                    batch_loss.backward()
-                    
-                    total_pot_loss += pot_loss_batch.item()
-                    total_force_loss += force_loss_batch.item() / len(batch_vectors)
-                    
-                    del batch_vectors, pred_potentials_batch, pot_loss_batch, force_loss_batch, batch_loss
-                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                pred_potentials_scaled = pred_potentials * pred_scale
+                pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
+
+                total_potential_sum = torch.sum(pred_potentials_scaled)
+                pred_forces = -torch.autograd.grad(
+                    total_potential_sum, test_vectors_clone,
+                    create_graph=True, retain_graph=True
+                )[0]
+                
+                weights = 1.0 / (test_dists.detach() + 0.5)
+                weights = weights / weights.sum() 
+                force_diff = (pred_forces - true_forces) ** 2
+                force_loss = torch.sum(weights.unsqueeze(1) * force_diff) 
+
+                combined_loss = pot_loss + 5.0 * force_loss 
+                combined_loss.backward()
+                
+                total_pot_loss = pot_loss.item()
+                total_force_loss = force_loss.item()
             else:
                 pred_potentials = init_model.compute_potential(test_vectors_clone)
                 
