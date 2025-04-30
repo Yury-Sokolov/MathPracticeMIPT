@@ -615,76 +615,47 @@ def train_ude(args):
         test_vectors = torch.zeros((len(distances), 3), device=device)
         test_vectors[:, 0] = distances
         
-        with torch.no_grad():
-            test_vectors_grad = test_vectors.clone().requires_grad_(True)
-
-            if isinstance(model, KANPotentialModel):
-                potentials = model.compute_potential(test_vectors_grad)
-                
-                with torch.enable_grad():
-                    total_potential = potentials.sum()
-                    forces = -torch.autograd.grad(
-                        total_potential, test_vectors_grad, 
-                        create_graph=False, retain_graph=False
-                    )[0]
-                force_x = forces[:, 0]
-            
-            elif isinstance(model, PotentialNN):
-                potentials = model.compute_potential(test_vectors_grad)
-                with torch.enable_grad():
-                    total_potential = potentials.sum()
-                    forces = -torch.autograd.grad(
-                        total_potential, test_vectors_grad, 
-                        create_graph=False, retain_graph=False
-                    )[0]
-                force_x = forces[:, 0]
-            else:
-                 print("Warning: Unknown model type in check_force_profile")
-                 potentials = torch.zeros_like(distances)
-                 force_x = torch.zeros_like(distances)
-        if args.model_type == 'kan':
-            potentials = []
-            batch_size = 4
-            for i in range(0, len(distances), batch_size):
-                batch_vectors = test_vectors[i:i+batch_size]
-                batch_potentials = model.compute_potential(batch_vectors)
-                potentials.append(batch_potentials)
-            potentials = torch.cat(potentials, dim=0)
-            
-            force_x = []
-            for i, vec in enumerate(test_vectors):
-                vec_single = vec.unsqueeze(0).clone().requires_grad_(True)
-                pot_single = model.compute_potential(vec_single)
-                grad = torch.autograd.grad(
-                    pot_single, vec_single, 
-                    create_graph=False, retain_graph=False
-                )[0]
-                force_x.append(-grad[0, 0].item())
-            force_x = torch.tensor(force_x, device=device)
-        else:
-            potentials = model.compute_potential(test_vectors)
+        test_vectors_grad = test_vectors.clone().requires_grad_(True)
+        
+        if isinstance(model, (KANPotentialModel, PotentialNN)):
+            potentials = model.compute_potential(test_vectors_grad)
             total_potential = potentials.sum()
-            
             forces = -torch.autograd.grad(
-                total_potential, test_vectors, 
-                create_graph=False, retain_graph=True
+                total_potential, test_vectors_grad, 
+                create_graph=False,
+                retain_graph=False
             )[0]
-            
             force_x = forces[:, 0]
-        
-        term1 = g_rep * torch.exp(-m_rho*distances) * (m_rho/distances + 1/(distances**2))
-        term2 = g_att * torch.exp(-m_pi*distances) * (m_pi/distances + 1/(distances**2))
-        true_force_x = term1 - term2
-        
-        max_force = torch.max(torch.abs(force_x)).item()
-        mean_force = torch.mean(torch.abs(force_x)).item()
-        force_error = torch.mean((force_x - true_force_x) ** 2).item()
-        is_zero_like = max_force < 0.1
-        
-        potentials_np = potentials.detach().cpu().numpy()
-        
-        return max_force, mean_force, is_zero_like, force_x.cpu().numpy(), force_error, potentials_np
+        else:
+             print("Warning: Unknown model type in check_force_profile")
+             potentials = torch.zeros_like(distances, device=device)
+             force_x = torch.zeros_like(distances, device=device)
+
+        with torch.no_grad():
+            g_att = potential_params['g_att']
+            g_rep = potential_params['g_rep']
+            m_pi = potential_params['m_pi']
+            m_rho = potential_params['m_rho']
+            term1 = g_rep * torch.exp(-m_rho*distances) * (m_rho/distances + 1/(distances**2))
+            term2 = g_att * torch.exp(-m_pi*distances) * (m_pi/distances + 1/(distances**2))
+            true_force_x = term1 - term2
+            
+            max_force = torch.max(torch.abs(force_x)).item()
+            mean_force = torch.mean(torch.abs(force_x)).item()
+            force_error = torch.mean((force_x - true_force_x) ** 2).item()
+            is_zero_like = max_force < 0.1
+            
+            potentials_np = potentials.cpu().numpy()
+            force_x_np = force_x.cpu().numpy()
+            
+        return max_force, mean_force, is_zero_like, force_x_np, force_error, potentials_np
     
+    potential_params = data['potential_params']
+    g_att = potential_params['g_att']
+    g_rep = potential_params['g_rep']
+    m_pi = potential_params['m_pi']
+    m_rho = potential_params['m_rho']
+
     initial_max_force, initial_mean_force, _, _, initial_force_error, initial_potentials = check_force_profile(nn_model, device)
     print(f"Initial force profile: Max={initial_max_force:.4f}, Mean={initial_mean_force:.4f}, Error={initial_force_error:.4f}")
     
