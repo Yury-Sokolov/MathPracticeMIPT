@@ -1123,7 +1123,7 @@ def train_ude(args):
 def analyze_results(args):
     print("\n--- Starting Analysis ---")
     start_time = time.time()
-    output_dir = args.analysis_output_dir
+    output_dir = args.analysis_output_dir if hasattr(args, 'analysis_output_dir') else os.path.dirname(args.model_save_path)
     os.makedirs(output_dir, exist_ok=True)
     plot_trajectory_path = os.path.join(output_dir, "ude_trajectory_comparison.png")
     plot_force_path = os.path.join(output_dir, "ude_force_comparison.png")
@@ -1394,7 +1394,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Universal Differential Equation (UDE) for nucleon simulation')
     parser.add_argument('--mode', type=str, required=True, choices=['generate_data', 'train_ude', 'analyze_results'], help='Program operation mode')
     parser.add_argument('--model_save_path', type=str, default='./models/ude_model.pt', help='Path to save/load the trained model')
+    parser.add_argument('--model_load_path', type=str, default=None, help='Path to load the model for analysis (defaults to model_save_path if not provided)')
     parser.add_argument('--data_file', type=str, default='./data/ude_data.pt', help='Path to save/load the generated data')
+    parser.add_argument('--analysis_output_dir', type=str, default='./analysis', help='Directory to save analysis output files')
     parser.add_argument('--g_att', type=float, default=7.0, help='Attractive coupling constant')
     parser.add_argument('--g_rep', type=float, default=10.0, help='Repulsive coupling constant')
     parser.add_argument('--m_pi', type=float, default=0.7, help='Pion mass parameter')
