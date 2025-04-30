@@ -185,7 +185,7 @@ class KANPotentialModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.grid_size = 16
         
-        self.kan_network = kan.nn.MultKAN(
+        self.kan_network = kan.MultKAN(
             3,
             [hidden_dim] * num_layers + [1],
             grid=self.grid_size,
