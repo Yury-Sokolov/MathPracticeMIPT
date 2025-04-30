@@ -175,7 +175,7 @@ class PotentialNN(nn.Module):
 
 class KANPotentialModel(nn.Module):
     """Potential model based on Kolmogorov-Arnold Network (KAN)"""
-    def __init__(self, hidden_dim=64, num_layers=3, max_potential=100.0):
+    def __init__(self, hidden_dim=64, num_layers=3, max_potential=100.0, device='cuda'):
         super().__init__()
         
         if kan is None:
@@ -184,28 +184,31 @@ class KANPotentialModel(nn.Module):
         self.max_potential = max_potential
         self.hidden_dim = hidden_dim
         self.grid_size = 16
+        self.device = device
         
         try:
-            width_list = [3] + [hidden_dim] * num_layers + [1]
-            self.kan_network = kan.MultKAN(width_list, self.grid_size)
-            print(f"KAN успешно инициализирован с размерностями: {width_list}")
+            width_list = [4] + [hidden_dim] * num_layers + [1]
+            self.kan_network = kan.MultKAN(width_list, self.grid_size, device=self.device)
+            print(f"KAN успешно инициализирован с размерностями: {width_list} на устройстве {self.device}")
         except Exception as e:
             print(f"Ошибка инициализации KAN: {e}")
             print(f"Пробуем альтернативную инициализацию...")
             
             try:
                 self.kan_network = kan.KAN(
-                    [3, hidden_dim, hidden_dim, hidden_dim, 1], 
-                    grid=self.grid_size
+                    [4, hidden_dim, hidden_dim, hidden_dim, 1], 
+                    grid=self.grid_size,
+                    device=self.device
                 )
-                print("Успешно инициализирован KAN")
+                print(f"Успешно инициализирован KAN на устройстве {self.device}")
             except Exception as e2:
                 print(f"Вторая попытка инициализации KAN также не удалась: {e2}")
                 print("Используем очень простую инициализацию...")
                 
                 args = dir(kan.MultKAN.__init__)
                 print(f"Доступные аргументы KAN: {args}")
-                self.kan_network = kan.MultKAN([3, hidden_dim, 1], 10)
+                self.kan_network = kan.MultKAN([4, hidden_dim, 1], 10, device=self.device)
+                print(f"Успешно инициализирован KAN (простой) на устройстве {self.device}")
         
         self.scaling_factor = nn.Parameter(torch.ones(1) * 0.1)
     
@@ -279,40 +282,55 @@ class LossManager:
         return mse_loss + 0.2 * mae_loss + 0.3 * direction_loss
     
     def smoothness_loss(self, model, r_vectors):
-        """Regularization to ensure smooth potentials"""
+        """Regularization to ensure smooth potentials using Jacobian trace"""
+        if r_vectors.shape[0] == 0:
+            return torch.tensor(0.0, device=r_vectors.device)
+            
         r_vectors_grad = r_vectors.clone().requires_grad_(True)
         forces = model.compute_force(r_vectors_grad)
         
-        divergence = 0
-        for i in range(3):
-            dfi_dri = torch.autograd.grad(
-                forces[:, i].sum(), r_vectors_grad, create_graph=True
-            )[0][:, i]
-            divergence += dfi_dri
+        divergence = 0.0
+        for i in range(r_vectors.shape[1]):
+            v = torch.zeros_like(forces)
+            v[:, i] = 1.0
+            grad_outputs = torch.autograd.grad(
+                forces,
+                r_vectors_grad,
+                grad_outputs=v,
+                create_graph=True,
+                retain_graph=True
+            )[0]
+            divergence += grad_outputs[:, i]
         
+        r_vectors_grad.requires_grad_(False)
+
         return torch.mean(divergence**2)
     
     def symmetry_loss(self, model, r_vectors):
         """Enforce rotational symmetry"""
+        if r_vectors.shape[0] == 0:
+            return torch.tensor(0.0, device=r_vectors.device)
+            
         batch_size = r_vectors.shape[0]
         
-        theta = torch.rand(batch_size, 1, device=r_vectors.device) * 2 * np.pi
-        phi = torch.rand(batch_size, 1, device=r_vectors.device) * np.pi
+        axis = F.normalize(torch.randn(batch_size, 3, device=r_vectors.device), dim=1)
+        angle = torch.rand(batch_size, 1, device=r_vectors.device) * 2 * np.pi
         
-        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
-        zeros = torch.zeros_like(cos_t)
-        ones = torch.ones_like(cos_t)
+        cos_a = torch.cos(angle)
+        sin_a = torch.sin(angle)
+        ux, uy, uz = axis[:, 0:1], axis[:, 1:2], axis[:, 2:3]
         
-        R = torch.stack([
-            torch.cat([cos_t, -sin_t, zeros], dim=1),
-            torch.cat([sin_t, cos_t, zeros], dim=1),
-            torch.cat([zeros, zeros, ones], dim=1)
-        ], dim=1)
+        R = (
+            cos_a * torch.eye(3, device=r_vectors.device).unsqueeze(0) +
+            sin_a * torch.cross(axis.unsqueeze(2), torch.eye(3, device=r_vectors.device).unsqueeze(0).repeat(batch_size, 1, 1), dim=1) +
+            (1 - cos_a) * (axis.unsqueeze(2) @ axis.unsqueeze(1))
+        )
         
         r_rotated = torch.bmm(r_vectors.unsqueeze(1), R).squeeze(1)
         
         f_original = model.compute_force(r_vectors)
         f_rotated = model.compute_force(r_rotated)
+        
         f_rotated_inv = torch.bmm(f_rotated.unsqueeze(1), R.transpose(1, 2)).squeeze(1)
         
         return F.mse_loss(f_original, f_rotated_inv)
