@@ -201,21 +201,6 @@ class KANPotentialModel(nn.Module):
         
         self.kan = KAN(
             width=width_list,
-            grid=10,
-            k=3,
-            mult_arity=num_layers,
-            noise_scale=0.2,
-            scale_base_mu=0.0,
-            scale_base_sigma=1.0,
-            base_fun='silu',
-            symbolic_enabled=True,
-            affine_trainable=False,
-            grid_eps=0.02,
-            grid_range=[-1, 1],
-            sp_trainable=True,
-            sb_trainable=True,
-            seed=42,
-            save_act=True,
             device='cuda' if torch.cuda.is_available() else 'cpu'
         )
         
