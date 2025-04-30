@@ -229,6 +229,7 @@ def train_ude(args):
             'epochs': args.epochs,
             'nn_hidden_dim': args.nn_hidden_dim,
             'batch_size': args.batch_size,
+            'batch_accumulation_steps': args.batch_accumulation_steps,
             'use_scheduler': args.use_scheduler,
             'weight_decay': args.weight_decay,
             'num_residual_blocks': args.num_residual_blocks,
@@ -384,7 +385,7 @@ def train_ude(args):
     m_rho = potential_params['m_rho']
     
     true_potential_values = g_rep * torch.exp(-m_rho*test_dists) / test_dists - g_att * torch.exp(-m_pi*test_dists) / test_dists
-    true_potential_values -= torch.min(true_potential_values)  # Normalize potential
+    true_potential_values -= torch.min(true_potential_values)
 
     term1 = g_rep * torch.exp(-m_rho*test_dists) * (m_rho/test_dists + 1/(test_dists**2))
     term2 = g_att * torch.exp(-m_pi*test_dists) * (m_pi/test_dists + 1/(test_dists**2))
@@ -416,34 +417,102 @@ def train_ude(args):
         with torch.enable_grad():
             test_vectors_clone = test_vectors.clone().requires_grad_(True)
             
-            pred_potentials = init_model.compute_potential(test_vectors_clone)
-            
-            pred_min = torch.min(pred_potentials)
-            pred_potentials = pred_potentials - pred_min
-            pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials.detach())
-            pred_potentials_scaled = pred_potentials * pred_scale
-            
-            pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
-            
-            total_potential = torch.sum(pred_potentials_scaled)
-            pred_forces = -torch.autograd.grad(
-                total_potential, test_vectors_clone, 
-                create_graph=True, retain_graph=True
-            )[0]
-            
-            weights = 1.0 / (test_dists.detach() + 0.5)
-            weights = weights / weights.sum()
-            force_diff = (pred_forces - true_forces) ** 2
-            force_loss = torch.sum(weights.unsqueeze(1) * force_diff)
-            
-            combined_loss = pot_loss + 5.0 * force_loss
-            combined_loss.backward()
+            if isinstance(init_model, KANPotentialModel):
+                mini_batch_size = 4
+                total_pot_loss = 0
+                total_force_loss = 0
+                
+                for i in range(0, len(test_vectors), mini_batch_size):
+                    batch_vectors = test_vectors_clone[i:i+mini_batch_size].clone().requires_grad_(True)
+                    
+                    pred_potentials_batch = init_model.compute_potential(batch_vectors)
+                    pred_min_batch = torch.min(pred_potentials_batch)
+                    pred_potentials_batch = pred_potentials_batch - pred_min_batch
+                    
+                    batch_indices = slice(i, min(i+mini_batch_size, len(test_vectors)))
+                    true_values_batch = true_potential_values[batch_indices]
+                    
+                    max_true = torch.max(true_values_batch)
+                    max_pred = torch.max(pred_potentials_batch.detach())
+                    if max_pred > 1e-6:
+                        pred_scale_batch = max_true / max_pred
+                    else:
+                        pred_scale_batch = 1.0
+                        
+                    pred_potentials_scaled_batch = pred_potentials_batch * pred_scale_batch
+                    pot_loss_batch = F.mse_loss(pred_potentials_scaled_batch, true_values_batch)
+                    
+                    force_loss_batch = 0
+                    for j in range(len(batch_vectors)):
+                        vec_idx = i + j
+                        if vec_idx >= len(test_vectors):
+                            break
+                            
+                        vec_single = batch_vectors[j].unsqueeze(0).clone().requires_grad_(True)
+                        pot_single = init_model.compute_potential(vec_single) * pred_scale_batch
+                        grad = torch.autograd.grad(
+                            pot_single, vec_single, 
+                            create_graph=True, retain_graph=True
+                        )[0]
+                        
+                        true_force_single = true_forces[vec_idx].unsqueeze(0)
+                        weight = 1.0 / (test_dists[vec_idx].detach() + 0.5)
+                        force_diff = torch.sum((-grad - true_force_single) ** 2) * weight
+                        force_loss_batch += force_diff
+                    
+                    batch_loss = pot_loss_batch + 5.0 * force_loss_batch / len(batch_vectors)
+                    batch_loss.backward()
+                    
+                    total_pot_loss += pot_loss_batch.item()
+                    total_force_loss += force_loss_batch.item() / len(batch_vectors)
+                    
+                    del batch_vectors, pred_potentials_batch, pot_loss_batch, force_loss_batch, batch_loss
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            else:
+                pred_potentials = init_model.compute_potential(test_vectors_clone)
+                
+                pred_min = torch.min(pred_potentials)
+                pred_potentials = pred_potentials - pred_min
+                pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials.detach())
+                pred_potentials_scaled = pred_potentials * pred_scale
+                
+                pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
+                
+                total_potential = torch.sum(pred_potentials_scaled)
+                pred_forces = -torch.autograd.grad(
+                    total_potential, test_vectors_clone, 
+                    create_graph=True, retain_graph=True
+                )[0]
+                
+                weights = 1.0 / (test_dists.detach() + 0.5)
+                weights = weights / weights.sum()
+                force_diff = (pred_forces - true_forces) ** 2
+                force_loss = torch.sum(weights.unsqueeze(1) * force_diff)
+                
+                combined_loss = pot_loss + 5.0 * force_loss
+                combined_loss.backward()
+                
+                total_pot_loss = pot_loss.item()
+                total_force_loss = force_loss.item()
         
         torch.nn.utils.clip_grad_norm_(init_model.parameters(), 1.0)
         init_optimizer.step()
+        
+        if isinstance(init_model, KANPotentialModel) and pre_epoch == 0:
+            print(f"  Pre-train epoch {pre_epoch+1}: Pot Loss={total_pot_loss:.6f}, Force Loss={total_force_loss:.6f}")
     
     with torch.no_grad():
-        pred_potentials = init_model.compute_potential(test_vectors)
+        if isinstance(init_model, KANPotentialModel):
+            pred_potentials = []
+            batch_size = 8
+            for i in range(0, len(test_vectors), batch_size):
+                batch_vectors = test_vectors[i:i+batch_size]
+                batch_potentials = init_model.compute_potential(batch_vectors)
+                pred_potentials.append(batch_potentials)
+            pred_potentials = torch.cat(pred_potentials, dim=0)
+        else:
+            pred_potentials = init_model.compute_potential(test_vectors)
+            
         pred_min = torch.min(pred_potentials)
         pred_potentials = pred_potentials - pred_min
         pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials)
@@ -466,7 +535,6 @@ def train_ude(args):
     )
     sim_model.nucleons['masses'] = masses
     
-    # Улучшенный оптимизатор с нормализацией градиентов
     if args.optimizer == 'adamw':
         optimizer = optim.AdamW(nn_model.parameters(), 
                               lr=args.learning_rate, 
@@ -491,7 +559,6 @@ def train_ude(args):
     if args.use_wandb:
         wandb.watch(nn_model, log="all", log_freq=10)
     
-    # Улучшенный шедулер для более стабильного обучения
     if args.use_scheduler:
         if args.scheduler_type == 'one_cycle':
             print(f"Using OneCycleLR scheduler for faster convergence")
@@ -538,8 +605,7 @@ def train_ude(args):
         param_group['initial_lr'] = args.learning_rate
         param_group['lr'] = args.learning_rate * 5
 
-    losses = []
-    val_losses = []
+
     force_profile_history = []
     
     print(f"Starting training for {args.epochs} epochs...")
@@ -567,15 +633,33 @@ def train_ude(args):
         test_vectors[:, 0] = distances
         test_vectors.requires_grad_(True)
         
-        potentials = model.compute_potential(test_vectors)
-        total_potential = potentials.sum()
-        
-        forces = -torch.autograd.grad(
-            total_potential, test_vectors, 
-            create_graph=False, retain_graph=True
-        )[0]
-        
-        force_x = forces[:, 0]
+        if isinstance(model, KANPotentialModel):
+            potentials = []
+            batch_size = 4
+            for i in range(0, len(distances), batch_size):
+                batch_vectors = test_vectors[i:i+batch_size]
+                batch_potentials = model.compute_potential(batch_vectors)
+                potentials.append(batch_potentials)
+            potentials = torch.cat(potentials, dim=0)
+            
+            force_x = []
+            for i, vec in enumerate(test_vectors):
+                vec_single = vec.unsqueeze(0).clone().requires_grad_(True)
+                pot_single = model.compute_potential(vec_single)
+                grad = torch.autograd.grad(pot_single, vec_single, 
+                                          create_graph=False, retain_graph=False)[0]
+                force_x.append(-grad[0, 0].item()) 
+            force_x = torch.tensor(force_x, device=device)
+        else:
+            potentials = model.compute_potential(test_vectors)
+            total_potential = potentials.sum()
+            
+            forces = -torch.autograd.grad(
+                total_potential, test_vectors, 
+                create_graph=False, retain_graph=True
+            )[0]
+            
+            force_x = forces[:, 0]
         
         term1 = g_rep * torch.exp(-m_rho*distances) * (m_rho/distances + 1/(distances**2))
         term2 = g_att * torch.exp(-m_pi*distances) * (m_pi/distances + 1/(distances**2))
@@ -607,7 +691,12 @@ def train_ude(args):
 
         nn_model.train()
 
-        batch_pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
+        effective_batch_size = max(1, args.batch_size // (4 if args.model_type == 'kan' else 1))
+        accumulation_steps = args.batch_accumulation_steps
+        num_batches = (num_steps_loss + effective_batch_size - 1) // effective_batch_size
+        
+        print(f"Using effective batch size: {effective_batch_size}, accumulation steps: {accumulation_steps}")
+        batch_pbar = tqdm(range(0, num_batches, accumulation_steps), desc=f"Epoch {epoch+1}/{args.epochs}", leave=False)
 
         for i in batch_pbar:
             optimizer.zero_grad(set_to_none=True)
@@ -619,113 +708,148 @@ def train_ude(args):
             batch_force_magnitude_loss = 0.0
             batch_smoothness_loss = 0.0
             
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, num_steps_loss)
-            batch_indices = permuted_indices[start_idx:end_idx]
-            current_batch_actual_size = len(batch_indices)
+            actual_accumulation_steps = min(accumulation_steps, num_batches - i)
             
-            for step_idx in batch_indices:
-                current_positions = normalized_positions_for_loss[step_idx].to(device)
-                current_target_accel = normalized_accel[step_idx].to(device)
-
-                with torch.set_grad_enabled(True):
-                    predicted_accels_step, _, _ = sim_model.compute_forces(
-                        current_positions * pos_std.to(device) + pos_mean.to(device)
-                    )
-                    
-                    predicted_accels_norm = predicted_accels_step / accel_scale.to(device)
-                    
-                    n_particles = current_positions.shape[0]
-                    total_loss = 0
-                    mse_loss_step = F.huber_loss(
-                        predicted_accels_norm, 
-                        current_target_accel,
-                        delta=1.0
-                    )
-                    
-                    symmetry_loss = 0.0
-                    force_magnitude_loss = 0.0
-                    smoothness_loss = 0.0
-
-                    if n_particles > 1:
-                        num_pairs = min(5, n_particles * (n_particles - 1) // 2)
-                        pair_indices = torch.randperm(n_particles, device=device)[:min(num_pairs * 2, n_particles)]
-                        
-                        for p_idx in range(0, len(pair_indices) - 1, 2):
-                            if p_idx + 1 >= len(pair_indices):
-                                break
-                                
-                            i, j = pair_indices[p_idx], pair_indices[p_idx + 1]
-                            pos_i = current_positions[i]
-                            pos_j = current_positions[j]
-                            rel_pos_ij = pos_i - pos_j
-                            
-                            if torch.norm(rel_pos_ij) < 1e-8:
-                                continue
-                                
-                            rel_pos_ij.requires_grad_(True)
-                            
-                            if epoch % 3 == 0:  
-                                r = torch.norm(rel_pos_ij)
-                                if r > 0.2 and r < r_cutoff:  
-                                    true_pot = (g_rep * torch.exp(-m_rho*r) / r - g_att * torch.exp(-m_pi*r) / r)
-                                    pred_pot = nn_model.compute_potential(rel_pos_ij.unsqueeze(0)).squeeze()
-                                    force_magnitude_loss += F.mse_loss(pred_pot, true_pot)
-                                
-                                smoothness_loss_batch = loss_manager.smoothness_loss(nn_model, rel_pos_ij.unsqueeze(0))
-                                smoothness_loss += smoothness_loss_batch
-                                
-                            symmetry_loss_batch = loss_manager.symmetry_loss(nn_model, rel_pos_ij.unsqueeze(0))
-                            symmetry_loss += symmetry_loss_batch
-                    
-                    if epoch < args.epochs // 10:
-                        mse_weight = 1.0
-                        symmetry_weight = args.symmetry_weight * 0.2
-                        smoothness_weight = args.smoothness_weight * 0.2
-                        force_magnitude_weight = 0.2
-                    elif epoch > args.epochs * 0.8:
-                        mse_weight = 0.8
-                        symmetry_weight = args.symmetry_weight * 1.5
-                        smoothness_weight = args.smoothness_weight * 1.5
-                        force_magnitude_weight = 1.5
-                    else:
-                        mse_weight = 1.0
-                        symmetry_weight = args.symmetry_weight
-                        smoothness_weight = args.smoothness_weight
-                        force_magnitude_weight = 1.0
-                    
-                    if zero_force_counter > 1:
-                        force_magnitude_weight *= 3.0
-                        
-                    combined_loss = (
-                        mse_weight * mse_loss_step + 
-                        symmetry_weight * symmetry_loss / max(1, num_pairs) +
-                        smoothness_weight * smoothness_loss / max(1, num_pairs) +
-                        force_magnitude_weight * force_magnitude_loss / max(1, num_pairs)
-                    )
+            for acc_step in range(actual_accumulation_steps):
+                batch_idx = i + acc_step
+                start_idx = batch_idx * effective_batch_size
+                end_idx = min((batch_idx + 1) * effective_batch_size, num_steps_loss)
+                batch_indices = permuted_indices[start_idx:end_idx]
+                current_batch_actual_size = len(batch_indices)
                 
-                    step_loss = combined_loss / current_batch_actual_size
-                    step_loss.backward()
-                    
-                batch_mse_loss += mse_loss_step.item()
-                batch_symmetry_loss += symmetry_loss if isinstance(symmetry_loss, float) else symmetry_loss.item()
-                batch_smoothness_loss += smoothness_loss if isinstance(smoothness_loss, float) else smoothness_loss.item()
-                batch_force_magnitude_loss += force_magnitude_loss if isinstance(force_magnitude_loss, float) else force_magnitude_loss.item()
-                batch_loss += combined_loss.item()
+                if current_batch_actual_size == 0:
+                    continue
                 
-                del current_positions, current_target_accel, predicted_accels_step, predicted_accels_norm
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                step_loss = 0.0
+                step_mse_loss = 0.0
+                step_symmetry_loss = 0.0
+                step_force_magnitude_loss = 0.0
+                step_smoothness_loss = 0.0
+                
+                mini_batch_size = 1 if args.model_type == 'kan' else current_batch_actual_size
+                
+                for mini_batch_start in range(0, current_batch_actual_size, mini_batch_size):
+                    mini_batch_end = min(mini_batch_start + mini_batch_size, current_batch_actual_size)
+                    mini_batch_indices = batch_indices[mini_batch_start:mini_batch_end]
+                    
+                    for step_idx in mini_batch_indices:
+                        current_positions = normalized_positions_for_loss[step_idx].to(device)
+                        current_target_accel = normalized_accel[step_idx].to(device)
+
+                        with torch.set_grad_enabled(True):
+                            predicted_accels_step, _, _ = sim_model.compute_forces(
+                                current_positions * pos_std.to(device) + pos_mean.to(device)
+                            )
+                            
+                            predicted_accels_norm = predicted_accels_step / accel_scale.to(device)
+                            
+                            n_particles = current_positions.shape[0]
+                            mse_loss_step = F.huber_loss(
+                                predicted_accels_norm, 
+                                current_target_accel,
+                                delta=1.0
+                            )
+                            
+                            symmetry_loss_item = 0.0
+                            force_magnitude_loss_item = 0.0
+                            smoothness_loss_item = 0.0
+
+                            if n_particles > 1:
+                                num_pairs = min(3 if args.model_type == 'kan' else 5, n_particles * (n_particles - 1) // 2) 
+                                pair_indices = torch.randperm(n_particles, device=device)[:min(num_pairs * 2, n_particles)]
+                                
+                                for p_idx in range(0, len(pair_indices) - 1, 2):
+                                    if p_idx + 1 >= len(pair_indices):
+                                        break
+                                        
+                                    i, j = pair_indices[p_idx], pair_indices[p_idx + 1]
+                                    pos_i = current_positions[i]
+                                    pos_j = current_positions[j]
+                                    rel_pos_ij = pos_i - pos_j
+                                    
+                                    if torch.norm(rel_pos_ij) < 1e-8:
+                                        continue
+                                        
+                                    rel_pos_ij.requires_grad_(True)
+                                    
+                                    if epoch % 3 == 0:  
+                                        r = torch.norm(rel_pos_ij)
+                                        if r > 0.2 and r < r_cutoff:  
+                                            true_pot = (g_rep * torch.exp(-m_rho*r) / r - g_att * torch.exp(-m_pi*r) / r)
+                                            pred_pot = nn_model.compute_potential(rel_pos_ij.unsqueeze(0)).squeeze()
+                                            force_magnitude_loss_item += F.mse_loss(pred_pot, true_pot).item()
+                                    
+                                        smoothness_loss_item_batch = loss_manager.smoothness_loss(nn_model, rel_pos_ij.unsqueeze(0))
+                                        if isinstance(smoothness_loss_item_batch, torch.Tensor):
+                                            smoothness_loss_item += smoothness_loss_item_batch.item()
+                                        else:
+                                            smoothness_loss_item += smoothness_loss_item_batch
+                                        
+                                    symmetry_loss_item_batch = loss_manager.symmetry_loss(nn_model, rel_pos_ij.unsqueeze(0))
+                                    if isinstance(symmetry_loss_item_batch, torch.Tensor):
+                                        symmetry_loss_item += symmetry_loss_item_batch.item()
+                                    else:
+                                        symmetry_loss_item += symmetry_loss_item_batch
+                            
+                            if epoch < args.epochs // 10:
+                                mse_weight = 1.0
+                                symmetry_weight = args.symmetry_weight * 0.2
+                                smoothness_weight = args.smoothness_weight * 0.2
+                                force_magnitude_weight = 0.2
+                            elif epoch > args.epochs * 0.8:
+                                mse_weight = 0.8
+                                symmetry_weight = args.symmetry_weight * 1.5
+                                smoothness_weight = args.smoothness_weight * 1.5
+                                force_magnitude_weight = 1.5
+                            else:
+                                mse_weight = 1.0
+                                symmetry_weight = args.symmetry_weight
+                                smoothness_weight = args.smoothness_weight
+                                force_magnitude_weight = 1.0
+                            
+                            if zero_force_counter > 1:
+                                force_magnitude_weight *= 3.0
+                                
+                            if args.model_type == 'kan':
+                                symmetry_weight *= 0.3
+                                smoothness_weight *= 0.3
+                                
+                            combined_loss = (
+                                mse_weight * mse_loss_step + 
+                                symmetry_weight * symmetry_loss_item / max(1, num_pairs) +
+                                smoothness_weight * smoothness_loss_item / max(1, num_pairs) +
+                                force_magnitude_weight * force_magnitude_loss_item / max(1, num_pairs)
+                            )
+                        
+                            mini_batch_scale = 1.0 / (current_batch_actual_size * actual_accumulation_steps)
+                            step_loss_item = combined_loss * mini_batch_scale
+                            step_loss_item.backward()
+                        
+                        step_mse_loss += mse_loss_step.item() * mini_batch_scale
+                        step_symmetry_loss += symmetry_loss_item * mini_batch_scale / max(1, num_pairs)
+                        step_smoothness_loss += smoothness_loss_item * mini_batch_scale / max(1, num_pairs)
+                        step_force_magnitude_loss += force_magnitude_loss_item * mini_batch_scale / max(1, num_pairs)
+                        step_loss += combined_loss.item() * mini_batch_scale
+                        
+                        del current_positions, current_target_accel, predicted_accels_step, predicted_accels_norm
+                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+                batch_mse_loss += step_mse_loss
+                batch_symmetry_loss += step_symmetry_loss
+                batch_smoothness_loss += step_smoothness_loss
+                batch_force_magnitude_loss += step_force_magnitude_loss
+                batch_loss += step_loss
 
             if args.clip_grad > 0:
                 torch.nn.utils.clip_grad_norm_(nn_model.parameters(), args.clip_grad)
 
             optimizer.step()
 
-            avg_batch_loss = batch_loss / current_batch_actual_size
-            avg_batch_mse = batch_mse_loss / current_batch_actual_size
-            avg_batch_sym = batch_symmetry_loss / current_batch_actual_size
-            avg_batch_smooth = batch_smoothness_loss / current_batch_actual_size
-            avg_batch_mag = batch_force_magnitude_loss / current_batch_actual_size
+            avg_batch_loss = batch_loss
+            avg_batch_mse = batch_mse_loss
+            avg_batch_sym = batch_symmetry_loss
+            avg_batch_smooth = batch_smoothness_loss
+            avg_batch_mag = batch_force_magnitude_loss
             
             if torch.isnan(torch.tensor(avg_batch_loss)) or torch.isinf(torch.tensor(avg_batch_loss)):
                 print(f"\nWarning: NaN/Inf loss detected in epoch {epoch+1}, batch {i+1}")
@@ -772,30 +896,39 @@ def train_ude(args):
         val_batches = 0
         
         with torch.no_grad():
-            for val_idx in val_indices:
-                if val_idx >= len(normalized_positions_for_loss):
-                    continue
+            val_batch_size = min(16, len(val_indices)) if args.model_type == 'kan' else len(val_indices)
+            
+            for i in range(0, len(val_indices), val_batch_size):
+                batch_val_indices = val_indices[i:i+val_batch_size]
+                val_loss_batch = 0.0
+                
+                for val_idx in batch_val_indices:
+                    if val_idx >= len(normalized_positions_for_loss):
+                        continue
+                        
+                    val_pos = normalized_positions_for_loss[val_idx].to(device)
+                    val_target_accel = normalized_accel[val_idx].to(device)
                     
-                val_pos = normalized_positions_for_loss[val_idx].to(device)
-                val_target_accel = normalized_accel[val_idx].to(device)
-                
-                val_pred_accels, _, _ = sim_model.compute_forces(
-                    val_pos * pos_std.to(device) + pos_mean.to(device)
-                )
-                
-                val_pred_accels_norm = val_pred_accels / accel_scale.to(device)
-                
-                val_loss_batch = F.huber_loss(
-                    val_pred_accels_norm, 
-                    val_target_accel,
-                    delta=1.0
-                )
-                
-                val_loss += val_loss_batch.item()
-                val_batches += 1
-                
-                del val_pos, val_target_accel, val_pred_accels, val_pred_accels_norm
-                
+                    val_pred_accels, _, _ = sim_model.compute_forces(
+                        val_pos * pos_std.to(device) + pos_mean.to(device)
+                    )
+                    
+                    val_pred_accels_norm = val_pred_accels / accel_scale.to(device)
+                    
+                    val_loss_step = F.huber_loss(
+                        val_pred_accels_norm, 
+                        val_target_accel,
+                        delta=1.0
+                    )
+                    
+                    val_loss_batch += val_loss_step.item()
+                    val_batches += 1
+                    
+                    del val_pos, val_target_accel, val_pred_accels, val_pred_accels_norm
+                    
+                val_loss += val_loss_batch
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
             avg_val_loss = val_loss / max(1, val_batches)
             
         avg_epoch_loss = epoch_loss / num_steps_loss
@@ -901,6 +1034,14 @@ def train_ude(args):
     
     print(f"Saving trained MLP model to {args.model_save_path}...")
     torch.save(nn_model.state_dict(), args.model_save_path)
+
+    if args.model_type == 'kan':
+        kan_metadata = {
+            'hidden_dim': args.nn_hidden_dim,
+            'num_layers': args.num_residual_blocks,
+            'max_potential': args.max_potential
+        }
+        torch.save(kan_metadata, args.model_save_path.replace('.pt', '_metadata.pt'))
 
     if best_loss < avg_epoch_loss:
         print(f"Loading best model from {args.model_save_path}...")
@@ -1263,6 +1404,7 @@ if __name__ == "__main__":
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping value')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training. Set to 0 for auto-determination.')
+    parser.add_argument('--batch_accumulation_steps', type=int, default=4, help='Number of batches to accumulate gradients for (reduces memory usage)')
     parser.add_argument('--nn_hidden_dim', type=int, default=256, help='Hidden dimension of the neural network')
     parser.add_argument('--num_residual_blocks', type=int, default=4, help='Number of residual blocks in the neural network')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to run on')
