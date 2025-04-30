@@ -210,7 +210,7 @@ class KANPotentialModel(nn.Module):
                 self.kan_network = kan.MultKAN([4, hidden_dim, 1], 10, device=self.device)
                 print(f"Успешно инициализирован KAN (простой) на устройстве {self.device}")
         
-        self.scaling_factor = nn.Parameter(torch.ones(1) * 0.1)
+        self.scaling_factor = nn.Parameter(torch.ones(1, device=self.device) * 0.1)
     
     def compute_potential(self, r_vectors):
         """Calculate potential energy using KAN"""
