@@ -1422,7 +1422,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training. Set to 0 for auto-determination.')
     parser.add_argument('--batch_accumulation_steps', type=int, default=4, help='Number of batches to accumulate gradients for (reduces memory usage)')
-    parser.add_argument('--nn_hidden_dim', type=int, default=256, help='Hidden dimension of the neural network')
+    parser.add_argument('--nn_hidden_dim', type=int, default=16, help='Hidden dimension of the neural network')
     parser.add_argument('--num_residual_blocks', type=int, default=4, help='Number of residual blocks in the neural network')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to run on')
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')

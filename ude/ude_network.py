@@ -39,7 +39,7 @@ class ResidualBlock(nn.Module):
         return out
 
 class PotentialNN(nn.Module):
-    def __init__(self, hidden_dim=256, num_blocks=4, input_dim=3, max_potential=100.0, dropout_rate=0.1):
+    def __init__(self, hidden_dim=16, num_blocks=4, input_dim=3, max_potential=100.0, dropout_rate=0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.input_dim = input_dim
