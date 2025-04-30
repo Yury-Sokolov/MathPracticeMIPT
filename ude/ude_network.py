@@ -223,9 +223,9 @@ class KANPotentialModel(nn.Module):
         normalized_r = r_vectors / safe_r_norm
         
         r_scaled = torch.clamp(r_norm / 5.0, 0.0, 1.0) 
-        kan_input = torch.cat([r_scaled, normalized_r], dim=1)
+        kan_input = torch.cat([r_scaled, normalized_r], dim=1) 
         
-        potential_raw = self.kan_network(kan_input)
+        potential_raw = self.kan_network(kan_input.contiguous()) 
 
         potential = torch.tanh(potential_raw) * torch.abs(self.scaling_factor) * self.max_potential
         
