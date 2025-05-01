@@ -323,9 +323,9 @@ class LossManager:
         ux, uy, uz = axis[:, 0:1], axis[:, 1:2], axis[:, 2:3]
         
         R = (
-            cos_a * torch.eye(3, device=r_vectors.device).unsqueeze(0) +
-            sin_a * torch.cross(axis.unsqueeze(2), torch.eye(3, device=r_vectors.device).unsqueeze(0).repeat(batch_size, 1, 1), dim=1) +
-            (1 - cos_a) * (axis.unsqueeze(2) @ axis.unsqueeze(1))
+            cos_a.unsqueeze(-1) * torch.eye(3, device=r_vectors.device).unsqueeze(0) +
+            sin_a.unsqueeze(-1) * torch.cross(axis.unsqueeze(2), torch.eye(3, device=r_vectors.device).unsqueeze(0).repeat(batch_size, 1, 1), dim=1) +
+            (1 - cos_a).unsqueeze(-1) * (axis.unsqueeze(2) @ axis.unsqueeze(1))
         )
         
         r_rotated = torch.bmm(r_vectors.unsqueeze(1), R).squeeze(1)
