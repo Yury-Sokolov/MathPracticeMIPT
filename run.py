@@ -721,11 +721,10 @@ def train_ude(args):
                         reduction='mean' 
                     )
                     
-                    symmetry_loss_batch_total = 0.0
-                    force_magnitude_loss_batch_total = 0.0
-                    smoothness_loss_batch_total = 0.0
-                    num_pairs_total = 0
-
+                    symmetry_loss_tensor = torch.tensor(0.0, device=device)
+                    smoothness_loss_tensor = torch.tensor(0.0, device=device)
+                    magnitude_loss_tensor = torch.tensor(0.0, device=device)
+                    
                     if n_particles > 1:
                         num_pairs_per_instance = min(3 if args.model_type == 'kan' else 5, n_particles * (n_particles - 1) // 2) 
                         
@@ -753,7 +752,6 @@ def train_ude(args):
 
                                 if r_norm > 1e-6:
                                     all_rel_pos_ij.append(rel_pos_ij.unsqueeze(0))
-                                    num_pairs_total += 1
                                     
                                     if epoch % 3 == 0 and r_norm > 0.2 and r_norm < r_cutoff:
                                         true_pot = (g_rep * torch.exp(-m_rho*r_norm) / r_norm - g_att * torch.exp(-m_pi*r_norm) / r_norm)
@@ -761,16 +759,13 @@ def train_ude(args):
                                     else:
                                         all_true_potentials.append(torch.tensor([torch.nan], device=device))
 
-                        if num_pairs_total > 0:
+                        if len(all_rel_pos_ij) > 0:
                             all_rel_pos_ij_tensor = torch.cat(all_rel_pos_ij, dim=0).requires_grad_(True)
                             all_true_potentials_tensor = torch.cat(all_true_potentials, dim=0)
                             
-                            symmetry_loss_batch = loss_manager.symmetry_loss(nn_model, all_rel_pos_ij_tensor)
-                            smoothness_loss_batch = loss_manager.smoothness_loss(nn_model, all_rel_pos_ij_tensor)
+                            symmetry_loss_tensor = loss_manager.symmetry_loss(nn_model, all_rel_pos_ij_tensor)
+                            smoothness_loss_tensor = loss_manager.smoothness_loss(nn_model, all_rel_pos_ij_tensor)
                             
-                            symmetry_loss_batch_total = symmetry_loss_batch.item() if isinstance(symmetry_loss_batch, torch.Tensor) else symmetry_loss_batch
-                            smoothness_loss_batch_total = smoothness_loss_batch.item() if isinstance(smoothness_loss_batch, torch.Tensor) else smoothness_loss_batch
-
                             valid_pot_indices = ~torch.isnan(all_true_potentials_tensor)
                             if torch.any(valid_pot_indices):
                                 valid_rel_pos = all_rel_pos_ij_tensor[valid_pot_indices]
@@ -778,19 +773,12 @@ def train_ude(args):
                                 
                                 if valid_rel_pos.shape[0] > 0:
                                     pred_pot_magnitude = nn_model.compute_potential(valid_rel_pos)
-                                    force_magnitude_loss_batch = F.mse_loss(pred_pot_magnitude, valid_true_pots)
-                                    force_magnitude_loss_batch_total = force_magnitude_loss_batch.item() if isinstance(force_magnitude_loss_batch, torch.Tensor) else force_magnitude_loss_batch
+                                    magnitude_loss_tensor = F.mse_loss(pred_pot_magnitude, valid_true_pots)
                                      
-                        else:
-                            symmetry_loss_batch = torch.tensor(0.0, device=device)
-                            smoothness_loss_batch = torch.tensor(0.0, device=device)
-                            force_magnitude_loss_batch = torch.tensor(0.0, device=device)
-                                    
-                    else:
-                         symmetry_loss_batch = torch.tensor(0.0, device=device)
-                         smoothness_loss_batch = torch.tensor(0.0, device=device)
-                         force_magnitude_loss_batch = torch.tensor(0.0, device=device)
-                         num_pairs_total = 1
+                    else: 
+                         symmetry_loss_tensor = torch.tensor(0.0, device=device)
+                         smoothness_loss_tensor = torch.tensor(0.0, device=device)
+                         magnitude_loss_tensor = torch.tensor(0.0, device=device)
                          
                     if epoch < args.epochs // 10:
                         mse_weight = 1.0
@@ -817,27 +805,22 @@ def train_ude(args):
                         
                     combined_loss_batch = (
                         mse_weight * mse_loss_batch + 
-                        symmetry_weight * symmetry_loss_batch + 
-                        smoothness_weight * smoothness_loss_batch + 
-                        force_magnitude_weight * force_magnitude_loss_batch 
+                        symmetry_weight * symmetry_loss_tensor + 
+                        smoothness_weight * smoothness_loss_tensor + 
+                        force_magnitude_weight * magnitude_loss_tensor 
                     )
                 
                 accumulation_scale = 1.0 / actual_accumulation_steps
                 scaled_loss = combined_loss_batch * accumulation_scale
-                scaled_loss.backward()
+                scaled_loss.backward() 
                 
                 batch_mse_loss += mse_loss_batch.item() * accumulation_scale
-                batch_symmetry_loss += symmetry_loss_batch_total * accumulation_scale 
-                batch_smoothness_loss += smoothness_loss_batch_total * accumulation_scale
-                batch_force_magnitude_loss += force_magnitude_loss_batch_total * accumulation_scale
+                batch_symmetry_loss += symmetry_loss_tensor.item() * accumulation_scale 
+                batch_smoothness_loss += smoothness_loss_tensor.item() * accumulation_scale
+                batch_force_magnitude_loss += magnitude_loss_tensor.item() * accumulation_scale
                 batch_loss += combined_loss_batch.item() * accumulation_scale
                 
                 del current_positions_batch, current_target_accel_batch, predicted_accels_batch, predicted_accels_norm_batch
-                del unnorm_positions_batch, all_rel_pos_ij, all_true_potentials
-                if 'all_rel_pos_ij_tensor' in locals(): del all_rel_pos_ij_tensor
-                if 'all_true_potentials_tensor' in locals(): del all_true_potentials_tensor
-                if 'valid_rel_pos' in locals(): del valid_rel_pos
-                if 'pred_pot_magnitude' in locals(): del pred_pot_magnitude
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
             if args.clip_grad > 0:
