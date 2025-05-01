@@ -304,8 +304,6 @@ class LossManager:
             )[0]
             divergence += grad_outputs[:, i]
         
-        r_vectors_grad.requires_grad_(False)
-
         return torch.mean(divergence**2)
     
     def symmetry_loss(self, model, r_vectors):
