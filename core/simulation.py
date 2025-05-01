@@ -101,26 +101,40 @@ class Simulation:
 
     def _compute_nn_forces(self, positions):
         """
-        Вычисляет силы между частицами с использованием нейронной сети
+        Computes forces between particles using the neural network.
+        Handles both single instance [N, 3] and batched [B, N, 3] input.
         """
-        n_particles = positions.shape[0]
+        is_batched = positions.dim() == 3
+        if not is_batched:
+            positions = positions.unsqueeze(0)
+
+        batch_size, n_particles, _ = positions.shape
         total_forces = torch.zeros_like(positions)
 
-        indices_i, indices_j = torch.triu_indices(n_particles, n_particles, offset=1)
-        indices_i = indices_i.to(self.device)
-        indices_j = indices_j.to(self.device)
+        indices_j, indices_i = torch.triu_indices(n_particles, n_particles, offset=1, device=self.device)
+        num_pairs = indices_i.shape[0]
 
-        if len(indices_i) == 0:
-            return total_forces, None, None
+        if num_pairs == 0:
+            return total_forces.squeeze(0) if not is_batched else total_forces, None, None 
 
-        pos_i = positions[indices_i]
-        pos_j = positions[indices_j]
-        relative_pos_ij = pos_i - pos_j
+        pos_i = positions[:, indices_i, :] 
+        pos_j = positions[:, indices_j, :] 
+        relative_pos_ij_batch = pos_i - pos_j
+
+        relative_pos_ij_flat = relative_pos_ij_batch.reshape(-1, 3)
         
-        forces_ij = self.neural_network(relative_pos_ij)
+        forces_ij_flat = self.neural_network(relative_pos_ij_flat)
 
-        total_forces.index_add_(0, indices_i, forces_ij)
-        total_forces.index_add_(0, indices_j, -forces_ij)
+        forces_ij_batch = forces_ij_flat.reshape(batch_size, num_pairs, 3)
+
+        batch_indices_i = indices_i.unsqueeze(0).expand(batch_size, -1)
+        batch_indices_j = indices_j.unsqueeze(0).expand(batch_size, -1)
+
+        total_forces = total_forces.scatter_add_(1, batch_indices_i.unsqueeze(-1).expand(-1, -1, 3), forces_ij_batch)
+        total_forces = total_forces.scatter_add_(1, batch_indices_j.unsqueeze(-1).expand(-1, -1, 3), -forces_ij_batch)
+        
+        if not is_batched:
+            total_forces = total_forces.squeeze(0)
 
         return total_forces, None, None
 
