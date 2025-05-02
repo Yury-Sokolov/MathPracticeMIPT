@@ -879,42 +879,41 @@ def train_ude(args):
         val_loss = 0.0
         val_batches = 0
         
-        with torch.no_grad():
-            val_batch_size = min(16, len(val_indices)) if args.model_type == 'kan' else len(val_indices)
+        val_batch_size = min(16, len(val_indices)) if args.model_type == 'kan' else len(val_indices)
+        
+        for i in range(0, len(val_indices), val_batch_size):
+            batch_val_indices = val_indices[i:i+val_batch_size]
+            val_loss_batch = 0.0
             
-            for i in range(0, len(val_indices), val_batch_size):
-                batch_val_indices = val_indices[i:i+val_batch_size]
-                val_loss_batch = 0.0
+            for val_idx in batch_val_indices:
+                if val_idx >= len(normalized_positions_for_loss):
+                    continue
+                    
+                val_pos = normalized_positions_for_loss[val_idx].to(device)
+                val_target_accel = normalized_accel[val_idx].to(device)
                 
-                for val_idx in batch_val_indices:
-                    if val_idx >= len(normalized_positions_for_loss):
-                        continue
-                        
-                    val_pos = normalized_positions_for_loss[val_idx].to(device)
-                    val_target_accel = normalized_accel[val_idx].to(device)
-                    
-                    val_pred_accels, _, _ = sim_model.compute_forces(
-                        val_pos * pos_std.to(device) + pos_mean.to(device)
-                    )
-                    
-                    val_pred_accels_norm = val_pred_accels / accel_scale.to(device)
-                    
-                    val_loss_step = F.huber_loss(
-                        val_pred_accels_norm, 
-                        val_target_accel,
-                        delta=1.0
-                    )
-                    
-                    val_loss_batch += val_loss_step.item()
-                    val_batches += 1
-                    
-                    del val_pos, val_target_accel, val_pred_accels, val_pred_accels_norm
-                    
-                val_loss += val_loss_batch
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
-            avg_val_loss = val_loss / max(1, val_batches)
-            
+                val_pred_accels, _, _ = sim_model.compute_forces(
+                    val_pos * pos_std.to(device) + pos_mean.to(device)
+                )
+                
+                val_pred_accels_norm = val_pred_accels / accel_scale.to(device)
+                
+                val_loss_step = F.huber_loss(
+                    val_pred_accels_norm, 
+                    val_target_accel,
+                    delta=1.0
+                )
+                
+                val_loss_batch += val_loss_step.item()
+                val_batches += 1
+                
+                del val_pos, val_target_accel, val_pred_accels, val_pred_accels_norm
+                
+            val_loss += val_loss_batch
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        avg_val_loss = val_loss / max(1, val_batches)
+        
         avg_epoch_loss = epoch_loss / num_steps_loss
         avg_epoch_mse = epoch_mse_loss / num_steps_loss
         avg_epoch_sym = epoch_symmetry_loss / num_steps_loss
