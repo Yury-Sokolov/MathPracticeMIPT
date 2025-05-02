@@ -94,7 +94,7 @@ def generate_data(args):
     all_velocities = []
     all_masses = None
 
-    random_impact_params = np.sqrt(np.random.random(args.num_collisions)) * args.max_impact_parameter
+    random_impact_params = numpy.sqrt(numpy.random.random(args.num_collisions)) * args.max_impact_parameter
     
     if args.use_wandb:
         wandb.log({"impact_parameters": wandb.Histogram(random_impact_params)})
@@ -107,8 +107,8 @@ def generate_data(args):
         result = sim.run(**run_params)
 
         times_coll = torch.tensor(result['times'], dtype=torch.float32).cpu()
-        pos_coll = torch.from_numpy(np.array(result['positions'])).float().cpu()
-        vel_coll = torch.from_numpy(np.array(result['velocities'])).float().cpu()
+        pos_coll = torch.from_numpy(numpy.array(result['positions'])).float().cpu()
+        vel_coll = torch.from_numpy(numpy.array(result['velocities'])).float().cpu()
 
         all_times.append(times_coll)
         all_positions.append(pos_coll)
@@ -946,7 +946,7 @@ def train_ude(args):
                 "epoch/is_zero_like": int(is_zero_like),
                 "epoch/learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch/force_profile": wandb.plot.line_series(
-                    xs=np.linspace(0.2, 4.0, 40),
+                    xs=numpy.linspace(0.2, 4.0, 40),
                     ys=[force_profile, 
                         term1.cpu().numpy() - term2.cpu().numpy()],
                     keys=["Predicted", "True"],
@@ -954,7 +954,7 @@ def train_ude(args):
                     xname="Distance"
                 ),
                 "epoch/potential_profile": wandb.plot.line_series(
-                    xs=np.linspace(0.2, 4.0, 40),
+                    xs=numpy.linspace(0.2, 4.0, 40),
                     ys=[potentials],
                     keys=["Potential"],
                     title="Potential Profile",
@@ -1046,7 +1046,7 @@ def train_ude(args):
     
     plot_force_evolution_path = os.path.join(output_dir, "force_profile_evolution.png")
     print(f"Saving force profile evolution plot to {plot_force_evolution_path}...")
-    distances = np.linspace(0.2, 4.0, 40)
+    distances = numpy.linspace(0.2, 4.0, 40)
     
     plt.figure(figsize=(12, 8))
     
@@ -1064,7 +1064,7 @@ def train_ude(args):
     plt.plot(distances, true_forces_plot, 'k-', linewidth=3, label='True Force')
     
     num_profiles = 5
-    indices = np.linspace(0, len(force_profile_history)-1, num_profiles, dtype=int)
+    indices = numpy.linspace(0, len(force_profile_history)-1, num_profiles, dtype=int)
     
     cmap = plt.cm.viridis
     for i, idx in enumerate(indices):
@@ -1124,7 +1124,6 @@ def train_ude(args):
             
             try:
                 from sympy import symbols, sympify, lambdify
-                import numpy as np
                 
                 plt.figure(figsize=(12, 6))
                 
@@ -1133,8 +1132,8 @@ def train_ude(args):
                 m_pi = potential_params['m_pi']
                 m_rho = potential_params['m_rho']
                 
-                r = np.linspace(0.2, r_cutoff, 200)
-                true_potential = g_rep * np.exp(-m_rho*r) / r - g_att * np.exp(-m_pi*r) / r
+                r = numpy.linspace(0.2, r_cutoff, 200)
+                true_potential = g_rep * numpy.exp(-m_rho*r) / r - g_att * numpy.exp(-m_pi*r) / r
                 plt.plot(r, true_potential, 'k-', label='True Potential', linewidth=2)
                 
                 try:
@@ -1320,7 +1319,7 @@ def analyze_results(args):
     noisy_positions_first = noisy_positions[:num_steps_per_traj]
 
     num_particles_to_plot = min(5, true_positions_first.shape[1])
-    time_indices = np.linspace(0, num_steps_per_traj-1, num=min(num_steps_per_traj, 200), dtype=int)
+    time_indices = numpy.linspace(0, num_steps_per_traj-1, num=min(num_steps_per_traj, 200), dtype=int)
     time_points_plot = times_single_traj[time_indices].cpu().numpy()
 
     plt.figure(figsize=(12, 8))
