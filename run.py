@@ -5,6 +5,7 @@ import sys
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
+import numpy
 import argparse
 import time
 import wandb
@@ -219,6 +220,7 @@ def train_ude(args):
     start_time = time.time()
     output_dir = os.path.dirname(args.model_save_path)
     os.makedirs(output_dir, exist_ok=True)
+    
 
     if args.use_wandb:
         wandb_config = {
@@ -279,7 +281,7 @@ def train_ude(args):
         print("Warning: Could not robustly determine original dt. Using default 0.001")
     
     train_indices, val_indices = train_test_split(
-        np.arange(data['noisy_positions'].shape[0]), 
+        numpy.arange(data['noisy_positions'].shape[0]), 
         test_size=0.1, 
         random_state=42
     )
