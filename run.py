@@ -1067,8 +1067,8 @@ def train_ude(args):
     cmap = plt.cm.viridis
     for i, idx in enumerate(indices):
         if idx < len(force_profile_history):
-            epoch_num = int(idx * args.epochs / (len(force_profile_history)-1))
-            color = cmap(i / (num_profiles - 1))
+            epoch_num = int(idx * args.epochs / (len(force_profile_history)))
+            color = cmap(i / (num_profiles))
             plt.plot(distances, force_profile_history[idx], '--', color=color, alpha=0.7, 
                      label=f'Epoch {epoch_num+1}')
     
@@ -1101,6 +1101,95 @@ def train_ude(args):
     end_time = time.time()
     print(f"--- UDE Training Finished ({end_time - start_time:.2f}s) ---")
 
+    if args.model_type == 'kan':
+        print("\n--- Extracting Symbolic Formula from KAN Model ---")
+        try:
+            kan_formula = nn_model.get_symbolic_formula(precision=4, simplify=True)
+            print(f"\nСимволическая формула потенциала (KAN):")
+            print(f"{kan_formula}")
+            
+            formula_file = args.model_save_path.replace('.pt', '_formula.txt')
+            with open(formula_file, 'w') as f:
+                f.write(f"KAN Symbolic Formula:\n{kan_formula}\n\n")
+                f.write(f"Model Parameters:\n")
+                f.write(f"hidden_dim: {args.nn_hidden_dim}\n")
+                f.write(f"num_residual_blocks: {args.num_residual_blocks}\n")
+                f.write(f"epochs: {args.epochs}\n")
+                f.write(f"learning_rate: {args.learning_rate}\n")
+                f.write(f"max_potential: {args.max_potential}\n")
+            
+            print(f"Формула сохранена в {formula_file}")
+            
+            try:
+                from sympy import symbols, sympify, lambdify
+                import numpy as np
+                
+                plt.figure(figsize=(12, 6))
+                
+                g_att = potential_params['g_att']
+                g_rep = potential_params['g_rep']
+                m_pi = potential_params['m_pi']
+                m_rho = potential_params['m_rho']
+                
+                r = np.linspace(0.2, r_cutoff, 200)
+                true_potential = g_rep * np.exp(-m_rho*r) / r - g_att * np.exp(-m_pi*r) / r
+                plt.plot(r, true_potential, 'k-', label='True Potential', linewidth=2)
+                
+                try:
+                    r_sym = symbols('r_norm')
+                    can_be_evaluated = False
+                    
+                    kan_formula_clean = kan_formula
+                    for term in ["torch.", "tanh(", ")", "["]:
+                        kan_formula_clean = kan_formula_clean.replace(term, "")
+                    
+                    kan_expr = sympify(kan_formula_clean)
+                    kan_func = lambdify(r_sym, kan_expr, 'numpy')
+                    
+                    can_be_evaluated = True
+                except Exception as eval_err:
+                    print(f"Не удалось оценить формулу как выражение sympy: {eval_err}")
+                    can_be_evaluated = False
+                
+                if can_be_evaluated:
+                    try:
+                        kan_potential = kan_func(r)
+                        plt.plot(r, kan_potential, 'r--', label='KAN Formula', linewidth=2)
+                    except Exception as e:
+                        print(f"Ошибка при вычислении значений KAN формулы: {e}")
+                
+                with torch.no_grad():
+                    r_tensor = torch.from_numpy(r).float().to(device)
+                    zeros = torch.zeros_like(r_tensor)
+                    
+                    r_vectors = torch.stack([r_tensor, zeros, zeros], dim=-1)
+                    
+                    kan_potentials = nn_model.compute_potential(r_vectors).cpu().numpy()
+                    plt.plot(r, kan_potentials, 'b--', label='KAN Model', linewidth=2)
+                
+                plt.xlabel('Distance (r)')
+                plt.ylabel('Potential')
+                plt.title('Comparison of True Potential vs KAN Symbolic Formula vs KAN Model')
+                plt.legend()
+                plt.grid(True)
+                
+                formula_plot_file = args.model_save_path.replace('.pt', '_formula_comparison.png')
+                plt.savefig(formula_plot_file)
+                plt.close()
+                
+                print(f"Сравнительный график сохранен в {formula_plot_file}")
+                
+                if args.use_wandb:
+                    wandb.log({
+                        "kan_symbolic_formula": kan_formula,
+                        "kan_formula_comparison": wandb.Image(formula_plot_file)
+                    })
+            except ImportError as e:
+                print(f"Не удалось создать сравнительный график: {e}")
+                
+        except Exception as e:
+            print(f"Ошибка при извлечении символической формулы: {e}")
+            
 def analyze_results(args):
     print("\n--- Starting Analysis ---")
     start_time = time.time()

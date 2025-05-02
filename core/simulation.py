@@ -123,10 +123,8 @@ class Simulation:
 
         relative_pos_ij_flat = relative_pos_ij_batch.reshape(-1, 3)
         
-        # Всегда создаем копию с requires_grad=True для обеспечения вычисления градиентов
         relative_pos_ij_flat_grad = relative_pos_ij_flat.clone().requires_grad_(True)
         
-        # Напрямую вызываем forward вместо compute_force, чтобы избежать двойного вызова grad
         forces_ij_flat = self.neural_network(relative_pos_ij_flat_grad)
 
         forces_ij_batch = forces_ij_flat.reshape(batch_size, num_pairs, 3)

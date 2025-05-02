@@ -259,6 +259,44 @@ class KANPotentialModel(nn.Module):
         """Forward pass computing forces from distance vectors"""
         return self.compute_force(r_vectors.clone())
 
+    def get_symbolic_formula(self, precision=3, simplify=True):
+        """
+        Извлекает символическую формулу из обученной KAN сети
+        
+        Args:
+            precision (int): Количество знаков после запятой в коэффициентах
+            simplify (bool): Нужно ли упрощать формулу
+            
+        Returns:
+            str: Символическая формула потенциала
+        """
+        try:
+            if hasattr(self.kan_network, 'get_formula'):
+                formula = self.kan_network.get_formula(precision=precision, simplify=simplify)
+                
+                scale_factor = self.scaling_factor.item()
+                formula = f"({formula}) * {scale_factor:.{precision}f} * (1.0 / (1.0 + r_norm))"
+                
+                return formula
+            elif hasattr(self.kan_network, 'get_expression'):
+                formula = self.kan_network.get_expression(precision=precision, simplify=simplify)
+                
+                scale_factor = self.scaling_factor.item()
+                formula = f"({formula}) * {scale_factor:.{precision}f} * (1.0 / (1.0 + r_norm))"
+                
+                return formula
+            elif hasattr(self.kan_network, 'get_symbolic_expression'):
+                formula = self.kan_network.get_symbolic_expression(precision=precision, simplify=simplify)
+                
+                scale_factor = self.scaling_factor.item()
+                formula = f"({formula}) * {scale_factor:.{precision}f} * (1.0 / (1.0 + r_norm))"
+                
+                return formula
+            else:
+                return "Функция извлечения формулы не найдена в реализации KAN"
+        except Exception as e:
+            return f"Ошибка при извлечении формулы: {str(e)}"
+
 
 class LossManager:
     """Class to handle different loss functions and combinations"""
