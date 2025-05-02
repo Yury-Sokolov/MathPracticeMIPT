@@ -151,7 +151,7 @@ class PotentialNN(nn.Module):
         
         potential = self.compute_potential(r_vectors_grad)
         
-        total_potential = torch.sum(potential.contiguous())
+        total_potential = torch.sum(potential)
         
         forces = -torch.autograd.grad(
             total_potential, r_vectors_grad, 
@@ -170,7 +170,7 @@ class PotentialNN(nn.Module):
         Returns:
             Tensor of vector forces [batch_size, 3]
         """
-        return self.compute_force(r_vectors)
+        return self.compute_force(r_vectors.clone())
 
 
 class KANPotentialModel(nn.Module):
@@ -225,7 +225,10 @@ class KANPotentialModel(nn.Module):
         r_scaled = torch.clamp(r_norm / 5.0, 0.0, 1.0) 
         kan_input = torch.cat([r_scaled, normalized_r], dim=1) 
 
-        potential_raw = self.kan_network(kan_input.contiguous())
+        if r_vectors.requires_grad:
+            kan_input.requires_grad_(True)
+            
+        potential_raw = self.kan_network(kan_input)
 
         potential = torch.tanh(potential_raw) * torch.abs(self.scaling_factor) * self.max_potential
         
@@ -242,7 +245,8 @@ class KANPotentialModel(nn.Module):
         r_vectors_grad = r_vectors.clone().requires_grad_(True)
         
         potential = self.compute_potential(r_vectors_grad)
-        total_potential = torch.sum(potential.contiguous())
+        
+        total_potential = torch.sum(potential)
         
         forces = -torch.autograd.grad(
             total_potential, r_vectors_grad, 
@@ -253,7 +257,7 @@ class KANPotentialModel(nn.Module):
     
     def forward(self, r_vectors):
         """Forward pass computing forces from distance vectors"""
-        return self.compute_force(r_vectors)
+        return self.compute_force(r_vectors.clone())
 
 
 class LossManager:

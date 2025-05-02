@@ -123,7 +123,12 @@ class Simulation:
 
         relative_pos_ij_flat = relative_pos_ij_batch.reshape(-1, 3)
         
-        forces_ij_flat = self.neural_network(relative_pos_ij_flat)
+        try:
+            forces_ij_flat = self.neural_network.compute_force(relative_pos_ij_flat)
+        except Exception as e:
+            print(f"Warning: Error in compute_force: {e}")
+            relative_pos_ij_flat_grad = relative_pos_ij_flat.clone().requires_grad_(True)
+            forces_ij_flat = self.neural_network(relative_pos_ij_flat_grad)
 
         forces_ij_batch = forces_ij_flat.reshape(batch_size, num_pairs, 3)
 
