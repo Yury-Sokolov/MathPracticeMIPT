@@ -1,0 +1,69 @@
+# Базовая конфигурация для проекта UDE
+
+# Параметры для генерации данных
+data:
+  output_file: "./data/ude_data.pt"
+  num_collisions: 100
+  noise_level: 0.0
+  save_interval: 1
+  dt_initial: 0.001
+  max_steps: 500
+
+# Параметры ядерного потенциала
+potential:
+  g_att: 7.0
+  g_rep: 10.0
+  m_pi: 0.7
+  m_rho: 3.5
+  r_cutoff: 5.0
+  r_core: 0.5
+
+# Параметры ядерной симуляции
+simulation:
+  t_end: 1.0
+  dt_min: 1e-16
+  tau_max: 0.001
+  Imax: 0.1
+  n_particles: 4
+  relative_velocity: 1.0
+  random_velocity: 0.1
+  radius: 1.5
+  max_impact_parameter: 3.0
+
+# Параметры модели нейронной сети
+model:
+  type: "kan"  # "potential_nn" или "kan"
+  hidden_dim: 16
+  num_residual_blocks: 4
+  max_potential: 100.0
+  dropout_rate: 0.1
+
+# Параметры обучения
+training:
+  model_save_path: "./models/ude_model.pt"
+  learning_rate: 0.001
+  weight_decay: 1e-5
+  clip_grad: 1.0
+  epochs: 100
+  batch_size: 128
+  batch_accumulation_steps: 4
+  use_scheduler: true
+  scheduler_type: "one_cycle"
+  optimizer: "adamw"
+  symmetry_weight: 0.5
+  smoothness_weight: 0.1
+  patience: 15
+
+# Параметры оценки модели
+evaluation:
+  model_load_path: null  # Если null, используется training.model_save_path
+  analysis_output_dir: "./analysis"
+  prediction_steps: 500
+
+# Настройки Weights & Biases
+wandb:
+  use_wandb: false
+  project: "mp"
+  entity: yury-sokolov
+  run_name: run
+  tags: [] 

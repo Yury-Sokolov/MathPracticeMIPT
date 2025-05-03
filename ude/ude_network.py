@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
+from typing import Optional, Tuple, List, Any
 try:
     import kan
 except ImportError:
@@ -18,394 +20,336 @@ class ScaleSILU(nn.Module):
         return F.silu(x) * self.scale
 
 class ResidualBlock(nn.Module):
-    def __init__(self, dim, dropout_rate=0.1):
+    """
+    Блок остаточной связи для глубоких нейронных сетей.
+    Предотвращает проблему исчезающего градиента.
+    """
+    
+    def __init__(self, dim: int, dropout_rate: float = 0.1):
+        """
+        Инициализация блока остаточной связи.
+        
+        Args:
+            dim: Размерность входа/выхода
+            dropout_rate: Вероятность отключения нейронов для регуляризации
+        """
         super().__init__()
         self.lin1 = nn.Linear(dim, dim)
         self.lin2 = nn.Linear(dim, dim)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.activation = ScaleSILU()
         self.dropout = nn.Dropout(dropout_rate)
-        self.activation = ScaleSILU(scale=1.414)
         
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Прямой проход через блок остаточной связи.
+        
+        Args:
+            x: Входной тензор [batch_size, dim]
+            
+        Returns:
+            Выходной тензор той же размерности
+        """
         identity = x
         out = self.lin1(x)
-        out = self.norm1(out)
         out = self.activation(out)
         out = self.dropout(out)
         out = self.lin2(out)
-        out = self.norm2(out)
-        out = self.activation(out + identity)
-        return out
+        out = self.activation(out)
+        out = self.dropout(out)
+        
+        return out + identity
+
+class DistanceFeatures(nn.Module):
+    """
+    Модуль для вычисления признаков из расстояний.
+    Преобразует относительные позиции в физически информативные признаки.
+    """
+    
+    def __init__(self, output_dim: int = 16, r_cutoff: float = 5.0):
+        """
+        Инициализирует модуль признаков расстояний.
+        
+        Args:
+            output_dim: Размерность выходных признаков
+            r_cutoff: Радиус отсечения
+        """
+        super(DistanceFeatures, self).__init__()
+        
+        self.output_dim = output_dim
+        self.r_cutoff = r_cutoff
+        
+        self.rbf_centers = nn.Parameter(
+            torch.linspace(0.3, r_cutoff, output_dim), 
+            requires_grad=False
+        )
+        self.rbf_widths = nn.Parameter(
+            torch.ones(output_dim) * 0.5, 
+            requires_grad=True
+        )
+    
+    def forward(self, rel_pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Прямой проход через модуль.
+        
+        Args:
+            rel_pos: Относительные позиции [batch_size, 3]
+            
+        Returns:
+            Кортеж (признаки, расстояния)
+        """
+        distances = torch.norm(rel_pos, dim=1, keepdim=True)
+        
+        safe_distances = torch.clamp(distances, min=1e-6)
+        
+        directions = rel_pos / safe_distances
+        
+        rbf_features = torch.exp(
+            -self.rbf_widths.abs() * (distances - self.rbf_centers.unsqueeze(0)) ** 2
+        )
+        
+        return rbf_features, distances.squeeze(1)
 
 class PotentialNN(nn.Module):
-    def __init__(self, hidden_dim=16, num_blocks=4, input_dim=3, max_potential=100.0, dropout_rate=0.1):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.input_dim = input_dim
-        self.max_potential = max_potential
-        
-        self.distance_embedding = nn.Sequential(
-            nn.Linear(1, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            ScaleSILU()
-        )
-        
-        self.inverse_embedding = nn.Sequential(
-            nn.Linear(1, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            ScaleSILU()
-        )
-        
-        self.inverse_squared_embedding = nn.Sequential(
-            nn.Linear(1, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            ScaleSILU()
-        )
-        
-        self.direction_embedding = nn.Sequential(
-            nn.Linear(3, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            ScaleSILU()
-        )
-        
-        self.res_blocks = nn.ModuleList([
-            ResidualBlock(hidden_dim, dropout_rate) for _ in range(num_blocks)
-        ])
-        
-        self.output_layer1 = nn.Linear(hidden_dim, hidden_dim)
-        self.output_norm1 = nn.LayerNorm(hidden_dim)
-        self.output_layer2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.output_norm2 = nn.LayerNorm(hidden_dim // 2)
-        self.output_layer3 = nn.Linear(hidden_dim // 2, 1)
-        
-        self.scaling_factor = nn.Parameter(torch.ones(1))
-        self.r_cutoff = nn.Parameter(torch.tensor(5.0))
-        
-        self._init_weights()
-        
-    def _init_weights(self):
-        """Improved weight initialization for stable training"""
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        
-        nn.init.normal_(self.output_layer3.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.output_layer3.bias)
-
-    def compute_potential(self, r_vectors):
+    """
+    Нейронная сеть для моделирования потенциальной энергии взаимодействия.
+    Принимает относительные позиции и предсказывает силы.
+    """
+    
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        num_blocks: int = 4,
+        max_potential: float = 50.0,
+        dropout_rate: float = 0.1,
+        device: str = "cuda"
+    ):
         """
-        Computes scalar potential for given distance vectors with improved features
+        Инициализация сети потенциальной энергии.
         
         Args:
-            r_vectors: Tensor of distance vectors [batch_size, 3]
+            hidden_dim: Размерность скрытых слоев
+            num_blocks: Количество блоков остаточной связи
+            max_potential: Максимальное значение потенциальной энергии
+            dropout_rate: Вероятность отключения нейронов
+            device: Устройство для вычислений ('cuda' или 'cpu')
+        """
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.num_blocks = num_blocks
+        self.max_potential = max_potential
+        self.device = device
+        
+        self.input_layer = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            ScaleSILU()
+        )
+        
+        self.residual_blocks = nn.ModuleList(
+            [ResidualBlock(hidden_dim, dropout_rate) for _ in range(num_blocks)]
+        )
+        
+        self.output_layer = nn.Linear(hidden_dim, 1)
+    
+    def compute_potential(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Вычисляет потенциальную энергию для заданных относительных позиций.
+        
+        Args:
+            r: Тензор относительных позиций [batch_size, 3]
             
         Returns:
-            Tensor of scalar potentials [batch_size]
+            Тензор потенциальных энергий [batch_size]
         """
-        distances = torch.norm(r_vectors, dim=-1, keepdim=True)
-        inverse_distances = 1.0 / (distances + 1e-6)
-        inverse_squared = 1.0 / (distances**2 + 1e-6)
+        if not isinstance(r, torch.Tensor):
+            raise TypeError(f"Ожидается torch.Tensor, получено {type(r)}")
+            
+        if r.ndim != 2 or r.shape[1] != 3:
+            raise ValueError(f"Ожидается тензор формы [batch_size, 3], получено {r.shape}")
+            
+        dist = torch.norm(r, dim=1, keepdim=True)
         
-        directions = r_vectors / (distances + 1e-6)
+        safe_dist = torch.clamp(dist, min=1e-10)
         
-        d_embedding = self.distance_embedding(distances)
-        inv_embedding = self.inverse_embedding(inverse_distances)
-        inv2_embedding = self.inverse_squared_embedding(inverse_squared)
-        dir_embedding = self.direction_embedding(directions)
+        r_normalized = r / safe_dist
         
-        x = torch.cat([d_embedding, inv_embedding, inv2_embedding, dir_embedding], dim=-1)
+        x = self.input_layer(r_normalized)
         
-        for block in self.res_blocks:
+        for block in self.residual_blocks:
             x = block(x)
         
-        x = self.output_layer1(x)
-        x = self.output_norm1(x)
-        x = F.silu(x)
+        raw_potential = self.output_layer(x)
         
-        x = self.output_layer2(x)
-        x = self.output_norm2(x)
-        x = F.silu(x)
+        scaled_potential = raw_potential / (1.0 + dist)
+        clamped_potential = torch.clamp(scaled_potential, -self.max_potential, self.max_potential)
         
-        potential = self.output_layer3(x)
-        
-        scaled_potential = self.scaling_factor * potential * inverse_distances
-        
-        cutoff_factor = torch.exp(-(distances / self.r_cutoff)**2)
-        
-        return scaled_potential.squeeze(-1) * cutoff_factor.squeeze(-1)
+        return clamped_potential.squeeze(-1)
     
-    def compute_force(self, r_vectors):
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
         """
-        Computes vector force as negative gradient of potential
+        Прямой проход: вычисляет силы на основе градиента потенциала.
         
         Args:
-            r_vectors: Tensor of distance vectors [batch_size, 3]
+            r: Тензор относительных позиций [batch_size, 3] с требованием градиента
             
         Returns:
-            Tensor of vector forces [batch_size, 3]
+            Тензор сил [batch_size, 3]
         """
-        r_vectors_grad = r_vectors.clone().requires_grad_(True)
+        if not isinstance(r, torch.Tensor):
+            raise TypeError(f"Ожидается torch.Tensor, получено {type(r)}")
+            
+        if r.ndim != 2 or r.shape[1] != 3:
+            raise ValueError(f"Ожидается тензор формы [batch_size, 3], получено {r.shape}")
+            
+        if not r.requires_grad:
+            r = r.detach().clone().requires_grad_(True)
         
-        potential = self.compute_potential(r_vectors_grad)
+        potential = self.compute_potential(r)
         
-        total_potential = torch.sum(potential)
+        potential_sum = torch.sum(potential)
         
         forces = -torch.autograd.grad(
-            total_potential, r_vectors_grad, 
-            create_graph=True, retain_graph=True
+            potential_sum, r, create_graph=True, retain_graph=True
         )[0]
         
         return forces
     
-    def forward(self, r_vectors):
+class KANPotentialModel(nn.Module):
+    """
+    Модель потенциальной энергии на основе Kolmogorov-Arnold Networks (KAN).
+    
+    KAN используют теорему Колмогорова-Арнольда для представления
+    многомерных функций через композиции одномерных функций,
+    что потенциально обеспечивает лучшую обобщающую способность.
+    """
+    
+    def __init__(
+        self,
+        hidden_dim: int = 16,
+        num_layers: int = 2,
+        max_potential: float = 50.0,
+        device: str = "cuda"
+    ):
         """
-        Forward pass computing forces from distance vectors
+        Инициализация KAN модели потенциала.
         
         Args:
-            r_vectors: Tensor of distance vectors [batch_size, 3]
-            
-        Returns:
-            Tensor of vector forces [batch_size, 3]
+            hidden_dim: Размерность скрытых слоев KAN
+            num_layers: Количество слоев в KAN
+            max_potential: Максимальное значение потенциальной энергии
+            device: Устройство для вычислений
         """
-        return self.compute_force(r_vectors.clone())
-
-
-class KANPotentialModel(nn.Module):
-    """Potential model based on Kolmogorov-Arnold Network (KAN)"""
-    def __init__(self, hidden_dim=64, num_layers=3, max_potential=100.0, device='cuda'):
         super().__init__()
         
         if kan is None:
-            raise ImportError("pykan is not installed. Please install with: pip install pykan")
+            raise ImportError("Package 'kan' is required but not installed")
             
-        self.max_potential = max_potential
         self.hidden_dim = hidden_dim
-        self.grid_size = 16
+        self.num_layers = num_layers
+        self.max_potential = max_potential
         self.device = device
         
-        try:
-            width_list = [4] + [hidden_dim] * num_layers + [1]
-            self.kan_network = kan.MultKAN(width_list, self.grid_size, device=self.device)
-            print(f"KAN успешно инициализирован с размерностями: {width_list} на устройстве {self.device}")
-        except Exception as e:
-            print(f"Ошибка инициализации KAN: {e}")
-            print(f"Пробуем альтернативную инициализацию...")
-            
-            try:
-                self.kan_network = kan.KAN(
-                    [4, hidden_dim, hidden_dim, hidden_dim, 1], 
-                    grid=self.grid_size,
-                    device=self.device
-                )
-                print(f"Успешно инициализирован KAN на устройстве {self.device}")
-            except Exception as e2:
-                print(f"Вторая попытка инициализации KAN также не удалась: {e2}")
-                print("Используем очень простую инициализацию...")
-                
-                args = dir(kan.MultKAN.__init__)
-                print(f"Доступные аргументы KAN: {args}")
-                self.kan_network = kan.MultKAN([4, hidden_dim, 1], 10, device=self.device)
-                print(f"Успешно инициализирован KAN (простой) на устройстве {self.device}")
+        self.kan_model = kan.KAN(
+            in_dim=3,
+            out_dim=1,
+            hidden_dims=[hidden_dim] * num_layers,
+            grid_size=10,
+            device=device
+        )
         
-        self.scaling_factor = nn.Parameter(torch.ones(1, device=self.device) * 0.1)
+        self.scale_factor = nn.Parameter(torch.tensor([1.0]))
     
-    def compute_potential(self, r_vectors):
-        """Calculate potential energy using KAN"""
-        is_batched = len(r_vectors.shape) > 1
-        if not is_batched:
-            r_vectors = r_vectors.unsqueeze(0) 
-        r_norm = torch.norm(r_vectors, dim=1, keepdim=True)
+    def compute_potential(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Вычисляет потенциальную энергию для заданных относительных позиций.
         
-        safe_r_norm = torch.clamp(r_norm, min=1e-6)
-        normalized_r = r_vectors / safe_r_norm
-        
-        r_scaled = torch.clamp(r_norm / 5.0, 0.0, 1.0) 
-        kan_input = torch.cat([r_scaled, normalized_r], dim=1) 
-
-        if r_vectors.requires_grad:
-            kan_input.requires_grad_(True)
+        Args:
+            r: Тензор относительных позиций [batch_size, 3]
             
-        potential_raw = self.kan_network(kan_input)
-
-        potential = torch.tanh(potential_raw) * torch.abs(self.scaling_factor) * self.max_potential
-        
-        decaying_factor = 1.0 / (1.0 + safe_r_norm)
-        scaled_potential = potential * decaying_factor
-        
-        if not is_batched:
-            scaled_potential = scaled_potential.squeeze(0)
+        Returns:
+            Тензор потенциальных энергий [batch_size]
+        """
+        if not isinstance(r, torch.Tensor):
+            raise TypeError(f"Ожидается torch.Tensor, получено {type(r)}")
             
-        return scaled_potential.squeeze(-1)
+        if r.ndim != 2 or r.shape[1] != 3:
+            raise ValueError(f"Ожидается тензор формы [batch_size, 3], получено {r.shape}")
+        
+        dist = torch.norm(r, dim=1, keepdim=True)
+        
+        safe_dist = torch.clamp(dist, min=1e-10)
+        
+        r_normalized = r / safe_dist
+        
+        raw_potential = self.kan_model(r_normalized)
+        
+        scaled_potential = raw_potential * self.scale_factor / (1.0 + dist)
+        
+        clamped_potential = torch.clamp(
+            scaled_potential, -self.max_potential, self.max_potential
+        )
+        
+        return clamped_potential.squeeze(-1)
     
-    def compute_force(self, r_vectors):
-        """Compute forces from potential using automatic differentiation"""
-        r_vectors_grad = r_vectors.clone().requires_grad_(True)
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Прямой проход: вычисляет силы на основе градиента потенциала.
         
-        potential = self.compute_potential(r_vectors_grad)
+        Args:
+            r: Тензор относительных позиций [batch_size, 3] с требованием градиента
+            
+        Returns:
+            Тензор сил [batch_size, 3]
+        """
+        if not isinstance(r, torch.Tensor):
+            raise TypeError(f"Ожидается torch.Tensor, получено {type(r)}")
+            
+        if r.ndim != 2 or r.shape[1] != 3:
+            raise ValueError(f"Ожидается тензор формы [batch_size, 3], получено {r.shape}")
+            
+        if not r.requires_grad:
+            r = r.detach().clone().requires_grad_(True)
         
-        total_potential = torch.sum(potential)
+        potential = self.compute_potential(r)
+        
+        potential_sum = torch.sum(potential)
         
         forces = -torch.autograd.grad(
-            total_potential, r_vectors_grad, 
-            create_graph=True, retain_graph=True
+            potential_sum, r, create_graph=True, retain_graph=True
         )[0]
         
         return forces
     
-    def forward(self, r_vectors):
-        """Forward pass computing forces from distance vectors"""
-        return self.compute_force(r_vectors.clone())
-
-    def get_symbolic_formula(self, precision=3, simplify=True):
+    def get_formula(self, precision: int = 4) -> str:
         """
-        Извлекает символическую формулу из обученной KAN сети
+        Возвращает формулу потенциала в символьном виде.
         
         Args:
-            precision (int): Количество знаков после запятой в коэффициентах
-            simplify (bool): Нужно ли упрощать формулу
+            precision: Количество знаков после запятой в коэффициентах
             
         Returns:
-            str: Символическая формула потенциала
+            Строка с формулой потенциала
         """
-        try:
-            if hasattr(self.kan_network, 'get_formula'):
-                formula = self.kan_network.get_formula(precision=precision, simplify=simplify)
-                
-                scale_factor = self.scaling_factor.item()
-                formula = f"({formula}) * {scale_factor:.{precision}f} * (1.0 / (1.0 + r_norm))"
-                
-                return formula
-            elif hasattr(self.kan_network, 'get_expression'):
-                formula = self.kan_network.get_expression(precision=precision, simplify=simplify)
-                
-                scale_factor = self.scaling_factor.item()
-                formula = f"({formula}) * {scale_factor:.{precision}f} * (1.0 / (1.0 + r_norm))"
-                
-                return formula
-            elif hasattr(self.kan_network, 'get_symbolic_expression'):
-                formula = self.kan_network.get_symbolic_expression(precision=precision, simplify=simplify)
-                
-                scale_factor = self.scaling_factor.item()
-                formula = f"({formula}) * {scale_factor:.{precision}f} * (1.0 / (1.0 + r_norm))"
-                
-                return formula
-            else:
-                return "Функция извлечения формулы не найдена в реализации KAN"
-        except Exception as e:
-            return f"Ошибка при извлечении формулы: {str(e)}"
+        var_names = ['x', 'y', 'z']
+        formula = self.kan_model.get_formula(var_names, precision)
+        
+        scale_str = f"{self.scale_factor.item():.{precision}f}"
+        formula = f"({scale_str}) * ({formula})"
+        
+        formula = f"({formula}) / (1 + sqrt(x^2 + y^2 + z^2))"
+        
+        return formula
 
-
-class LossManager:
-    """Class to handle different loss functions and combinations"""
-    def __init__(self, potential_weight=1.0, force_weight=1.0, 
-                 smoothness_weight=0.1, symmetric_weight=0.5):
-        self.potential_weight = potential_weight
-        self.force_weight = force_weight
-        self.smoothness_weight = smoothness_weight
-        self.symmetric_weight = symmetric_weight
+    def get_simplified_formula(self, precision: int = 4) -> str:
+        """
+        Возвращает упрощенную формулу потенциала.
         
-    def potential_loss(self, pred_potential, true_potential):
-        """MSE loss for potential values"""
-        return F.mse_loss(pred_potential, true_potential)
-    
-    def force_loss(self, pred_force, true_force):
-        """Combined L1 and L2 loss for forces"""
-        mse_loss = F.mse_loss(pred_force, true_force)
-        mae_loss = F.l1_loss(pred_force, true_force)
-        pred_norm = torch.norm(pred_force, dim=-1, keepdim=True) + 1e-8
-        true_norm = torch.norm(true_force, dim=-1, keepdim=True) + 1e-8
-        pred_dir = pred_force / pred_norm
-        true_dir = true_force / true_norm
-        direction_loss = 1.0 - F.cosine_similarity(pred_dir, true_dir, dim=-1).mean()
-        
-        return mse_loss + 0.2 * mae_loss + 0.3 * direction_loss
-    
-    def smoothness_loss(self, model, r_vectors):
-        """Regularization to ensure smooth potentials using Jacobian trace"""
-        if r_vectors.shape[0] == 0:
-            return torch.tensor(0.0, device=r_vectors.device)
+        Args:
+            precision: Количество знаков после запятой в коэффициентах
             
-        r_vectors_grad = r_vectors.clone().requires_grad_(True)
-        forces = model.compute_force(r_vectors_grad)
+        Returns:
+            Строка с упрощенной формулой
+        """
+        full_formula = self.get_formula(precision)
         
-        divergence = 0.0
-        for i in range(r_vectors.shape[1]):
-            v = torch.zeros_like(forces)
-            v[:, i] = 1.0
-            grad_outputs = torch.autograd.grad(
-                forces,
-                r_vectors_grad,
-                grad_outputs=v,
-                create_graph=True,
-                retain_graph=True
-            )[0]
-            divergence += grad_outputs[:, i]
-        
-        return torch.mean(divergence**2)
-    
-    def symmetry_loss(self, model, r_vectors):
-        """Enforce rotational symmetry"""
-        if r_vectors.shape[0] == 0:
-            return torch.tensor(0.0, device=r_vectors.device)
-            
-        batch_size = r_vectors.shape[0]
-        
-        axis = F.normalize(torch.randn(batch_size, 3, device=r_vectors.device), dim=1)
-        angle = torch.rand(batch_size, 1, device=r_vectors.device) * 2 * np.pi
-        
-        cos_a = torch.cos(angle)
-        sin_a = torch.sin(angle)
-        ux, uy, uz = axis[:, 0:1], axis[:, 1:2], axis[:, 2:3]
-        
-        R = (
-            cos_a.unsqueeze(-1) * torch.eye(3, device=r_vectors.device).unsqueeze(0) +
-            sin_a.unsqueeze(-1) * torch.cross(axis.unsqueeze(2), torch.eye(3, device=r_vectors.device).unsqueeze(0).repeat(batch_size, 1, 1), dim=1) +
-            (1 - cos_a).unsqueeze(-1) * (axis.unsqueeze(2) @ axis.unsqueeze(1))
-        )
-        
-        r_rotated = torch.bmm(r_vectors.unsqueeze(1), R).squeeze(1)
-        
-        f_original = model.compute_force(r_vectors)
-        f_rotated = model.compute_force(r_rotated)
-        
-        f_rotated_inv = torch.bmm(f_rotated.unsqueeze(1), R.transpose(1, 2)).squeeze(1)
-        
-        return F.mse_loss(f_original, f_rotated_inv)
-    
-    def total_loss(self, model, r_vectors, true_force, true_potential=None):
-        """Combined loss function"""
-        pred_force = model.compute_force(r_vectors)
-        force_l = self.force_loss(pred_force, true_force)
-        
-        potential_l = 0
-        if true_potential is not None and self.potential_weight > 0:
-            pred_potential = model.compute_potential(r_vectors)
-            potential_l = self.potential_loss(pred_potential, true_potential)
-        
-        smoothness_l = 0
-        if self.smoothness_weight > 0:
-            smoothness_l = self.smoothness_loss(model, r_vectors)
-            
-        symmetry_l = 0
-        if self.symmetric_weight > 0:
-            symmetry_l = self.symmetry_loss(model, r_vectors)
-        
-        total = (
-            self.force_weight * force_l + 
-            self.potential_weight * potential_l +
-            self.smoothness_weight * smoothness_l +
-            self.symmetric_weight * symmetry_l
-        )
-        
-        loss_components = {
-            'force': force_l.item(),
-            'potential': potential_l.item() if isinstance(potential_l, torch.Tensor) else 0,
-            'smoothness': smoothness_l.item() if isinstance(smoothness_l, torch.Tensor) else 0,
-            'symmetry': symmetry_l.item() if isinstance(symmetry_l, torch.Tensor) else 0,
-            'total': total.item()
-        }
-        
-        return total, loss_components
+        return full_formula

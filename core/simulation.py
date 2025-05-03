@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from .cluster import Cluster
+from utils.visualization import create_trajectory_animation, visualize_cluster_analysis, analyze_multiple_collision_results
 
 
 class Simulation:
@@ -22,7 +23,7 @@ class Simulation:
         self.adaptive_dt = adaptive_dt
         self.clustering_algorithm = clustering_algorithm
         self.clusters = []
-        self.nucleons = {
+        self.particles = {
             'positions': None,
             'velocities': None,
             'masses': None,
@@ -33,7 +34,7 @@ class Simulation:
         self.trajectories = []
         self.velocities_history = []
         
-        can_compile = True
+        can_compile = hasattr(torch, 'compile')
 
 
         if can_compile:
@@ -76,26 +77,26 @@ class Simulation:
         cluster_ids = torch.full((positions.shape[0],), cluster_id, 
                                  dtype=torch.long, device=self.device)
         
-        if self.nucleons['positions'] is None:
-            self.nucleons['positions'] = positions.to(self.device)
-            self.nucleons['velocities'] = velocities.to(self.device)
-            self.nucleons['masses'] = masses.to(self.device)
-            self.nucleons['cluster_ids'] = cluster_ids
+        if self.particles['positions'] is None:
+            self.particles['positions'] = positions.to(self.device)
+            self.particles['velocities'] = velocities.to(self.device)
+            self.particles['masses'] = masses.to(self.device)
+            self.particles['cluster_ids'] = cluster_ids
         else:
-            self.nucleons['positions'] = torch.cat([
-                self.nucleons['positions'],
+            self.particles['positions'] = torch.cat([
+                self.particles['positions'],
                 positions.to(self.device)
             ], dim=0)
-            self.nucleons['velocities'] = torch.cat([
-                self.nucleons['velocities'],
+            self.particles['velocities'] = torch.cat([
+                self.particles['velocities'],
                 velocities.to(self.device)
             ], dim=0)
-            self.nucleons['masses'] = torch.cat([
-                self.nucleons['masses'],
+            self.particles['masses'] = torch.cat([
+                self.particles['masses'],
                 masses.to(self.device)
             ], dim=0)
-            self.nucleons['cluster_ids'] = torch.cat([
-                self.nucleons['cluster_ids'],
+            self.particles['cluster_ids'] = torch.cat([
+                self.particles['cluster_ids'],
                 cluster_ids
             ], dim=0)
 
@@ -153,7 +154,7 @@ class Simulation:
         else:
             raise ValueError("No force calculation method available (potential or NN).")
 
-        acceleration = forces / self.nucleons['masses'].unsqueeze(1)
+        acceleration = forces / self.particles['masses'].unsqueeze(1)
 
         return acceleration, f_prime, f_double_prime
 
@@ -161,8 +162,8 @@ class Simulation:
         """
         Оптимизированная реализация вычисления адаптивного шага времени
         """
-        positions = self.nucleons['positions']
-        masses = self.nucleons['masses']
+        positions = self.particles['positions']
+        masses = self.particles['masses']
 
         r_ij = positions.unsqueeze(1) - positions.unsqueeze(0)  # [N, N, 3]
         r = torch.norm(r_ij, dim=2)  # [N, N]
@@ -185,7 +186,11 @@ class Simulation:
         mu = (m_i * m_j) / (m_i + m_j)  # [pairs]
         
         r_pairs = r[i_indices, j_indices]  # [pairs]
-        directions = r_ij[i_indices, j_indices] / r_pairs.unsqueeze(-1)  # [pairs, 3]
+        
+        valid_r = r_pairs > 1e-10
+        directions = torch.zeros((len(i_indices), 3), device=self.device)
+        if torch.any(valid_r):
+            directions[valid_r] = r_ij[i_indices[valid_r], j_indices[valid_r]] / r_pairs[valid_r].unsqueeze(-1)
         
         f_diff = f[i_indices] - f[j_indices]  # [pairs, 3]
         f_ij = torch.norm(f_diff, dim=1)  # [pairs]
@@ -211,14 +216,15 @@ class Simulation:
             f_prime_r_ij[idx] = f_prime_r_ij_val
             f_double_prime_r_ij[idx] = f_double_prime_r_ij_val
             
-            term1 = (dot_rv[idx]**3 / r_pairs[idx]**5) * (
-                r_pairs[idx] * f_prime_r_ij[idx] - f_ij[idx] - (r_pairs[idx]**2 * f_double_prime_r_ij[idx]) / 3
-            )
-            
-            term2 = (dot_rv[idx] / (mu[idx] * r_pairs[idx]**3)) * (
-                mu[idx] * v[idx]**2 * (f_ij[idx] - r_pairs[idx] * f_prime_r_ij[idx]) - 
-                r_pairs[idx]**2 * f_ij[idx] * f_prime_r_ij[idx]
-            )
+            if r_pairs[idx] > 1e-10:
+                term1 = (dot_rv[idx]**3 / r_pairs[idx]**5) * (
+                    r_pairs[idx] * f_prime_r_ij[idx] - f_ij[idx] - (r_pairs[idx]**2 * f_double_prime_r_ij[idx]) / 3
+                )
+
+                term2 = (dot_rv[idx] / (mu[idx] * r_pairs[idx]**3)) * (
+                    mu[idx] * v[idx]**2 * (f_ij[idx] - r_pairs[idx] * f_prime_r_ij[idx]) - 
+                    r_pairs[idx]**2 * f_ij[idx] * f_prime_r_ij[idx]
+                )
             
             S[idx] = term1 + term2
         
@@ -255,8 +261,19 @@ class Simulation:
         return new_positions, new_velocities, a_new, f_prime, f_double_prime
 
     def run(self, save_interval, dt_initial, max_steps):
-        positions = self.nucleons['positions']
-        velocities = self.nucleons['velocities']
+        """
+        Запускает симуляцию движения частиц.
+        
+        Args:
+            save_interval (int): Интервал шагов для сохранения состояния
+            dt_initial (float): Начальный шаг времени
+            max_steps (int): Максимальное количество шагов
+            
+        Returns:
+            dict: Результаты симуляции с ключами 'times', 'positions', 'velocities', 'masses'
+        """
+        positions = self.particles['positions']
+        velocities = self.particles['velocities']
         
         self.times = [0.0]
         self.trajectories = [positions.cpu().detach().numpy()]
@@ -269,7 +286,6 @@ class Simulation:
         forces, f_prime, f_double_prime = self.compute_forces(positions)
         a_prev = forces
 
-        # with tqdm(total=max_steps) as pb:
         while t < self.t_end and step_count < max_steps:
             positions, velocities, a_new, f_prime, f_double_prime = self._update_positions_velocities(
                 positions, velocities, a_prev, dt
@@ -286,21 +302,16 @@ class Simulation:
                 self.trajectories.append(positions.cpu().detach().numpy())
                 self.velocities_history.append(velocities.cpu().detach().numpy())
 
-                # pb.update(save_interval)
-                # pb.set_description(
-                #     f"t={t:.3f}, dt={dt:.3e}, progress={100 * t / self.t_end:.1f}%"
-                # )
-
             a_prev = a_new
 
-        self.nucleons['positions'] = positions
-        self.nucleons['velocities'] = velocities
+        self.particles['positions'] = positions
+        self.particles['velocities'] = velocities
 
 
         run_times = torch.tensor(self.times, dtype=torch.float32).detach()
         run_positions = torch.from_numpy(np.array(self.trajectories)).float().detach()
         run_velocities = torch.from_numpy(np.array(self.velocities_history)).float().detach()
-        run_masses = self.nucleons['masses'].cpu().detach()
+        run_masses = self.particles['masses'].cpu().detach()
         
         results = {
             'times': run_times,
@@ -323,7 +334,7 @@ class Simulation:
             
         final_positions = torch.tensor(self.trajectories[-1], device=self.device)
         final_velocities = torch.tensor(self.velocities_history[-1], device=self.device)
-        masses = self.nucleons['masses']
+        masses = self.particles['masses']
         
         if self.clustering_algorithm is not None:
             positions_np = final_positions.cpu().numpy()
@@ -332,7 +343,7 @@ class Simulation:
             
             cluster_ids = torch.tensor(cluster_labels, device=self.device)
         else:
-            cluster_ids = self.nucleons['cluster_ids']
+            cluster_ids = self.particles['cluster_ids']
         
         unique_cluster_ids = torch.unique(cluster_ids)
         if -1 in unique_cluster_ids:
@@ -343,26 +354,26 @@ class Simulation:
             'velocities': [],
             'masses': [],
             'sizes': [],
-            'nucleon_indices': [],
+            'particle_indices': [],
             'cluster_labels': cluster_ids.cpu().numpy()
         }
         
         for cluster_id in unique_cluster_ids:
             mask = cluster_ids == cluster_id
-            cluster_nucleons = final_positions[mask]
+            cluster_particles = final_positions[mask]
             cluster_velocities = final_velocities[mask]
             cluster_masses = masses[mask]
             
             if torch.sum(mask) > 0:
                 total_mass = torch.sum(cluster_masses)
-                com_position = torch.sum(cluster_nucleons * cluster_masses.unsqueeze(1), dim=0) / total_mass
+                com_position = torch.sum(cluster_particles * cluster_masses.unsqueeze(1), dim=0) / total_mass
                 com_velocity = torch.sum(cluster_velocities * cluster_masses.unsqueeze(1), dim=0) / total_mass
                 
                 cluster_data['positions'].append(com_position.cpu().numpy())
                 cluster_data['velocities'].append(com_velocity.cpu().numpy())
                 cluster_data['masses'].append(total_mass.cpu().numpy())
                 cluster_data['sizes'].append(torch.sum(mask).cpu().numpy())
-                cluster_data['nucleon_indices'].append(torch.where(mask)[0].cpu().numpy())
+                cluster_data['particle_indices'].append(torch.where(mask)[0].cpu().numpy())
         
         for key in ['positions', 'velocities', 'masses', 'sizes']:
             cluster_data[key] = np.array(cluster_data[key])
@@ -380,210 +391,21 @@ class Simulation:
         Returns:
             dict: Словарь с гистограммами распределений
         """
-        if not results:
-            print("Ошибка: нет данных для анализа")
-            return None
-            
-        all_masses = []
-        all_momenta = []
-        all_sizes = []
-        
-        for result in results:
-            if result is None:
-                continue
-                
-            masses = result['masses']
-            velocities = result['velocities']
-            
-            momenta = masses[:, np.newaxis] * velocities
-            momenta_magnitudes = np.linalg.norm(momenta, axis=1)
-            
-            all_masses.extend(masses)
-            all_momenta.extend(momenta_magnitudes)
-            all_sizes.extend(result['sizes'])
-        
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        
-        axes[0].hist(all_masses, bins=50, alpha=0.7)
-        axes[0].set_title('Распределение масс кластеров')
-        axes[0].set_xlabel('Масса')
-        axes[0].set_ylabel('Количество')
-        
-        axes[1].hist(all_momenta, bins=50, alpha=0.7)
-        axes[1].set_title('Распределение импульсов кластеров')
-        axes[1].set_xlabel('Импульс')
-        axes[1].set_ylabel('Количество')
-        
-        axes[2].hist(all_sizes, bins=range(1, max(all_sizes) + 2), alpha=0.7)
-        axes[2].set_title('Распределение размеров кластеров')
-        axes[2].set_xlabel('Количество нуклонов')
-        axes[2].set_ylabel('Количество')
-        
-        plt.tight_layout()
-        
-        return {
-            'masses': np.array(all_masses),
-            'momenta': np.array(all_momenta),
-            'sizes': np.array(all_sizes),
-            'figure': fig
-        }
+        return analyze_multiple_collision_results(results)
 
-    def create_animation(self, filename=None, fps=1, limit=10):
+    def compute_kinetic_energy_per_particle(self):
         """
-        Создание анимации с индивидуальными траекториями для каждой частицы
-
-        Args:
-            filename (str): Имя файла для сохранения анимации
-            fps (int): Кадров в секунду
-            limit (int): Границы пространства отображения
-        """
-        if not self.trajectories:
-            print("Ошибка: нет данных для анимации")
-            return None
-
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
-        ax.set(xlim=(-limit, limit), ylim=(-limit, limit), zlim=(-limit, limit))
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-
-        trajectories = np.asarray(self.trajectories)
-        frames_count = len(self.times)
-        n_particles = trajectories[0].shape[0]
-        
-        cluster_ids = self.nucleons['cluster_ids'].cpu().numpy()
-        unique_clusters = np.unique(cluster_ids)
-        cluster_colors = plt.cm.jet(np.linspace(0, 1, len(unique_clusters)))
-
-        colors = np.zeros((n_particles, 4))
-        for i, cluster_id in enumerate(unique_clusters):
-            mask = cluster_ids == cluster_id
-            colors[mask] = cluster_colors[i]
-        
-        scatter = ax.scatter([], [], [], s=50, alpha=0.8)
-        lines = [ax.plot([], [], [], c=colors[i], alpha=0.3)[0] for i in range(n_particles)]
-
-        scatter.set_facecolors(colors)
-        pb = tqdm(total=len(trajectories))
-        def update(frame):
-            current_positions = trajectories[frame]
-            scatter._offsets3d = current_positions.T
-            pb.update()
-            for i in range(n_particles):
-                x = trajectories[:frame + 1, i, 0]
-                y = trajectories[:frame + 1, i, 1]
-                z = trajectories[:frame + 1, i, 2]
-                lines[i].set_data(x, y)
-                lines[i].set_3d_properties(z)
-
-            ax.set_title(f't = {self.times[frame]:.5f}')
-            return [scatter] + lines
-
-        ani = animation.FuncAnimation(
-            fig, update, frames=frames_count,
-            init_func=lambda: [scatter] + lines,
-            blit=True, interval=1000 / fps
-        )
-
-        if filename:
-            try:
-                writer = animation.FFMpegWriter(fps=fps)
-                ani.save(filename, writer=writer)
-                pb.close()
-                print(f"Анимация сохранена в {filename}")
-            except Exception as e:
-                pb.close()
-                print(f"Ошибка сохранения: {str(e)}")
-
-        plt.close()
-        return ani
-
-    def reset(self):
-        """
-        Сброс состояния симуляции для повторного использования
-        
-        Сохраняет настройки, потенциал и алгоритм кластеризации, 
-        но очищает данные о траекториях, кластерах и нуклонах
-        """
-        self.clusters = []
-        self.nucleons = {
-            'positions': None,
-            'velocities': None,
-            'masses': None,
-            'cluster_ids': None
-        }
-        
-        self.times = []
-        self.trajectories = []
-        self.velocities_history = []
-
-    def cluster_analysis(self, clustering_algorithm, save_path=None, limit=10):
-        """
-        Анализ кластеров с использованием алгоритма из sklearn
-        
-        Args:
-            clustering_algorithm: Объект кластеризации из sklearn с методом fit_predict
-            save_path (str): Путь для сохранения графика кластеризации
-            
-        Returns:
-            np.ndarray: Метки кластеров для каждого нуклона
-        """
-        if not self.trajectories:
-            print("Ошибка: нет данных для кластеризации")
-            return None
-
-        final_positions = self.trajectories[-1]
-
-        cluster_labels = clustering_algorithm.fit_predict(final_positions)
-
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
-
-        unique_labels = np.unique(cluster_labels)
-        colors = plt.cm.jet(np.linspace(0, 1, len(unique_labels)))
-
-        for i, label in enumerate(unique_labels):
-            mask = cluster_labels == label
-            ax.scatter(
-                final_positions[mask, 0],
-                final_positions[mask, 1],
-                final_positions[mask, 2],
-                c=[colors[i]],
-                s=50,
-                alpha=0.8,
-                label=f'Кластер {label}'
-            )
-
-        ax.set_title('Результаты кластеризации')
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_xlim(-limit, limit)
-        ax.set_ylim(-limit, limit)
-        ax.set_zlim(-limit, limit)
-
-        if save_path:
-            plt.savefig(save_path)
-            print(f"График кластеризации сохранен в {save_path}")
-
-        plt.show()
-
-        return cluster_labels
-
-    def compute_kinetic_energy_per_nucleon(self):
-        """
-        Вычисление кинетической энергии для каждого нуклона
+        Вычисление кинетической энергии для каждой частицы
         
         Returns:
-            np.ndarray: Массив кинетических энергий каждого нуклона
+            np.ndarray: Массив кинетических энергий каждой частицы
         """
         if not self.velocities_history:
             print("Ошибка: нет данных о скоростях")
             return None
         
         velocities = self.velocities_history[-1]
-        masses = self.nucleons['masses'].cpu().numpy()
+        masses = self.particles['masses'].cpu().numpy()
         
         velocities_squared = np.sum(velocities**2, axis=1)
         
@@ -591,12 +413,12 @@ class Simulation:
         
         return kinetic_energies
 
-    def compute_potential_energy_per_nucleon(self):
+    def compute_potential_energy_per_particle(self):
         """
-        Вычисление потенциальной энергии для каждого нуклона
+        Вычисление потенциальной энергии для каждой частицы
         
         Returns:
-            np.ndarray: Массив потенциальных энергий каждого нуклона
+            np.ndarray: Массив потенциальных энергий каждой частицы
         """
         if not self.trajectories:
             print("Ошибка: нет данных о позициях")
@@ -607,16 +429,16 @@ class Simulation:
         
         return potential_energies.cpu().numpy()
 
-    def compute_total_energy_per_nucleon(self):
+    def compute_total_energy_per_particle(self):
         """
-        Вычисление полной энергии для каждого нуклона
+        Вычисление полной энергии для каждой частицы
         
         Returns:
             tuple: (массив кинетических энергий, массив потенциальных энергий, 
                    массив полных энергий)
         """
-        kinetic_energies = self.compute_kinetic_energy_per_nucleon()
-        potential_energies = self.compute_potential_energy_per_nucleon()
+        kinetic_energies = self.compute_kinetic_energy_per_particle()
+        potential_energies = self.compute_potential_energy_per_particle()
         
         if kinetic_energies is None or potential_energies is None:
             return None, None, None
@@ -631,11 +453,11 @@ class Simulation:
         Настройка симуляции для моделирования столкновения с заданным прицельным параметром
         
         Args:
-            nucleus_count1: Количество нуклонов в первом кластере
-            nucleus_count2: Количество нуклонов во втором кластере
+            nucleus_count1: Количество частиц в первом кластере
+            nucleus_count2: Количество частиц во втором кластере
             impact_parameter: Прицельный параметр (расстояние между центрами масс в плоскости xy)
             relative_velocity: Относительная скорость кластеров
-            random_velocity: Величина случайной скорости для нуклонов в кластерах
+            random_velocity: Величина случайной скорости для частиц в кластерах
             radius1: Радиус первого кластера
             radius2: Радиус второго кластера
             
@@ -720,14 +542,14 @@ class Simulation:
         
         Args:
             count: Количество симуляций
-            nucleus_count1: Количество нуклонов в первом кластере
-            nucleus_count2: Количество нуклонов во втором кластере
+            nucleus_count1: Количество частиц в первом кластере
+            nucleus_count2: Количество частиц во втором кластере
             velocity: Относительная скорость кластеров
             max_impact_parameter: Максимальный прицельный параметр
             save_interval: Интервал сохранения состояний
             dt_initial: Начальный шаг по времени
             max_steps: Максимальное количество шагов
-            random_velocity: Величина случайной скорости для нуклонов в кластерах
+            random_velocity: Величина случайной скорости для частиц в кластерах
             radius1: Радиус первого кластера
             radius2: Радиус второго кластера
             
@@ -762,13 +584,13 @@ class Simulation:
         Returns:
             Тензор энергии системы
         """
-        velocities = self.nucleons['velocities']
-        masses = self.nucleons['masses']
+        velocities = self.particles['velocities']
+        masses = self.particles['masses']
         
         kinetic_energy = 0.5 * torch.sum(masses.unsqueeze(1) * torch.sum(velocities**2, dim=-1))
         
         potential_energy = torch.tensor(0.0, device=self.device)
-        positions = self.nucleons['positions']
+        positions = self.particles['positions']
         
         if self.potential is not None and hasattr(self.potential, 'compute_energy_per_particle'):
             particle_potential = self.potential.compute_energy_per_particle(positions)
@@ -791,3 +613,22 @@ class Simulation:
                     potential_energy = torch.sum(pair_potentials)
         
         return kinetic_energy + potential_energy
+
+    def reset(self):
+        """
+        Сброс состояния симуляции для повторного использования
+        
+        Сохраняет настройки, потенциал и алгоритм кластеризации, 
+        но очищает данные о траекториях, кластерах и частицах
+        """
+        self.clusters = []
+        self.particles = {
+            'positions': None,
+            'velocities': None,
+            'masses': None,
+            'cluster_ids': None
+        }
+        
+        self.times = []
+        self.trajectories = []
+        self.velocities_history = []
