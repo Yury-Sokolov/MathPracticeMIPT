@@ -209,7 +209,7 @@ class KANPotentialModel(nn.Module):
                 print(f"Доступные аргументы KAN: {args}")
                 self.kan_network = kan.MultKAN([4, hidden_dim, 1], 10, device=self.device)
                 print(f"Успешно инициализирован KAN (простой) на устройстве {self.device}")
-        
+        self.kan_network.speed()
         self.scaling_factor = nn.Parameter(torch.ones(1, device=self.device) * 0.1)
     
     def compute_potential(self, r_vectors):
