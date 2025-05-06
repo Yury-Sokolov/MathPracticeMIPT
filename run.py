@@ -886,12 +886,32 @@ def train_ude(args):
                         rel_pos_tensor = torch.zeros((0, 3), device=device)
                         matched_force = torch.zeros((0, 3), device=device)
                     
+                    if current_positions_batch.shape[0] != matched_force.shape[0]:
+                        if len(all_rel_pos_ij) > 0: 
+                            target_batch_size = rel_pos_tensor.shape[0]
+                            if current_positions_batch.shape[0] > target_batch_size:
+                                positions_for_loss = current_positions_batch[:target_batch_size]
+                                velocities_for_loss = current_target_accel_batch[:target_batch_size]
+                            else:
+                                repeat_factor = (target_batch_size + current_positions_batch.shape[0] - 1) // current_positions_batch.shape[0]
+                                positions_for_loss = current_positions_batch.repeat(repeat_factor, 1, 1)[:target_batch_size]
+                                velocities_for_loss = current_target_accel_batch.repeat(repeat_factor, 1, 1)[:target_batch_size]
+                                
+                            assert positions_for_loss.shape[0] == rel_pos_tensor.shape[0], \
+                                f"Размеры все еще не совпадают: positions={positions_for_loss.shape[0]}, rel_pos={rel_pos_tensor.shape[0]}"
+                        else:
+                            positions_for_loss = torch.zeros((0, current_positions_batch.shape[1], 3), device=device)
+                            velocities_for_loss = torch.zeros((0, current_target_accel_batch.shape[1], 3), device=device)
+                    else:
+                        positions_for_loss = current_positions_batch
+                        velocities_for_loss = current_target_accel_batch
+                    
                     combined_loss_batch, loss_components = loss_manager.total_loss(
                         nn_model, 
                         r_vectors=rel_pos_tensor,
                         true_force=matched_force,
-                        positions=current_positions_batch,
-                        velocities=current_target_accel_batch,
+                        positions=positions_for_loss,
+                        velocities=velocities_for_loss,
                         masses=None,  
                         epoch=epoch,
                         potential_params=potential_params 

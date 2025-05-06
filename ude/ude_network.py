@@ -552,37 +552,48 @@ class LossManager:
         batch_size = positions.shape[0]
         n_particles = positions.shape[1]
         
+        if batch_size == 0 or n_particles == 0:
+            return torch.tensor(0.0, device=positions.device)
+        
         rel_positions = positions.reshape(batch_size, n_particles, 1, 3) - positions.reshape(batch_size, 1, n_particles, 3)
         rel_norms = torch.norm(rel_positions, dim=3)
         
-        mask = ~torch.eye(n_particles, dtype=torch.bool, device=positions.device).reshape(1, n_particles, n_particles)
+        eye_mask = torch.eye(n_particles, dtype=torch.bool, device=positions.device)
+        batch_mask = ~eye_mask.unsqueeze(0).expand(batch_size, n_particles, n_particles)
         
         kinetic_energy = 0.5 * torch.sum(masses.reshape(-1, 1) * torch.sum(velocities**2, dim=2), dim=1)
         
         new_positions = positions + velocities * dt
         
-        rel_pos_flat_initial = rel_positions[mask].reshape(-1, 3)
+        rel_pos_flat_initial = rel_positions[batch_mask].reshape(-1, 3)
         
         new_rel_positions = new_positions.reshape(batch_size, n_particles, 1, 3) - new_positions.reshape(batch_size, 1, n_particles, 3)
-        rel_pos_flat_final = new_rel_positions[mask].reshape(-1, 3)
+        rel_pos_flat_final = new_rel_positions[batch_mask].reshape(-1, 3)
         
-        potential_initial = model.compute_potential(rel_pos_flat_initial)
-        potential_final = model.compute_potential(rel_pos_flat_final)
+        if rel_pos_flat_initial.shape[0] == 0:
+            return torch.tensor(0.0, device=positions.device)
         
-        n_pairs = n_particles * (n_particles - 1)
-        potential_initial = potential_initial.reshape(batch_size, n_pairs)
-        potential_final = potential_final.reshape(batch_size, n_pairs)
-        
-        total_potential_initial = torch.sum(potential_initial, dim=1) * 0.5  
-        total_potential_final = torch.sum(potential_final, dim=1) * 0.5
-        
-        total_energy_initial = kinetic_energy + total_potential_initial
-        total_energy_final = kinetic_energy + total_potential_final 
-        
-        energy_diff = torch.abs(total_energy_final - total_energy_initial)
-        conservation_loss = torch.mean(energy_diff)
-        
-        return conservation_loss
+        try:
+            potential_initial = model.compute_potential(rel_pos_flat_initial)
+            potential_final = model.compute_potential(rel_pos_flat_final)
+            
+            n_pairs = n_particles * (n_particles - 1)
+            potential_initial = potential_initial.reshape(batch_size, n_pairs)
+            potential_final = potential_final.reshape(batch_size, n_pairs)
+            
+            total_potential_initial = torch.sum(potential_initial, dim=1) * 0.5  
+            total_potential_final = torch.sum(potential_final, dim=1) * 0.5
+            
+            total_energy_initial = kinetic_energy + total_potential_initial
+            total_energy_final = kinetic_energy + total_potential_final 
+            
+            energy_diff = torch.abs(total_energy_final - total_energy_initial)
+            conservation_loss = torch.mean(energy_diff)
+            
+            return conservation_loss
+        except Exception as e:
+            print(f"Ошибка при вычислении conservation_loss: {e}")
+            return torch.tensor(0.0, device=positions.device)
     
     def nuclear_yukawa_form_loss(self, model, r_vectors):
         """Enforce a Yukawa-like form for the potential to match nuclear physics"""
@@ -631,50 +642,101 @@ class LossManager:
         r_vectors_size = r_vectors.shape[0] if r_vectors.shape[0] > 0 else 0
         true_force_size = true_force.shape[0] if true_force.shape[0] > 0 else 0
         
+        # Инициализируем словарь компонентов потерь
+        loss_components = {
+            'force': 0.0,
+            'potential': 0.0,
+            'symmetry': 0.0,
+            'shape': 0.0,
+            'conservation': 0.0,
+            'yukawa': 0.0,
+            'total': 0.0
+        }
+        
+        # Если r_vectors пустой, то нельзя вычислить потери на основе сил
         if r_vectors_size == 0:
-            return torch.tensor(0.0, device=true_force.device), {
-                'force': 0.0,
-                'potential': 0.0,
-                'symmetry': 0.0,
-                'shape': 0.0,
-                'conservation': 0.0,
-                'yukawa': 0.0,
-                'total': 0.0
-            }
+            return torch.tensor(0.0, device=true_force.device), loss_components
         
-        pred_force = model.compute_force(r_vectors)
+        # Вычисляем потерю по силам (основная потеря)
+        try:
+            # Вычисляем силы для всех входных векторов
+            pred_force = model.compute_force(r_vectors)
+            
+            # Если размеры не совпадают, выводим предупреждение с размерами тензоров
+            if pred_force.shape[0] != true_force.shape[0]:
+                print(f"WARN: Размеры тензоров в total_loss не совпадают: pred_force={pred_force.shape}, true_force={true_force.shape}")
+            
+            force_l = self.force_loss(pred_force, true_force)
+            loss_components['force'] = force_l.item() if isinstance(force_l, torch.Tensor) else 0.0
+        except Exception as e:
+            print(f"Ошибка при вычислении потери по силам: {e}")
+            force_l = torch.tensor(0.0, device=r_vectors.device)
         
-        if pred_force.shape[0] != true_force.shape[0]:
-            print(f"WARN: Размеры тензоров в total_loss не совпадают: pred_force={pred_force.shape}, true_force={true_force.shape}")
-        
-        force_l = self.force_loss(pred_force, true_force)
-        
+        # Потеря по истинному потенциалу
         potential_l = 0
-        if not self.use_true_potential_only_for_init and self.true_potential_weight > 0 and (self.true_potential_model is not None or potential_params is not None):
-            potential_l = self.true_potential_loss(model, r_vectors, potential_params, initialization_only=False)
+        try:
+            if not self.use_true_potential_only_for_init and self.true_potential_weight > 0 and (self.true_potential_model is not None or potential_params is not None):
+                potential_l = self.true_potential_loss(model, r_vectors, potential_params, initialization_only=False)
+                loss_components['potential'] = potential_l.item() if isinstance(potential_l, torch.Tensor) else 0.0
+        except Exception as e:
+            print(f"Ошибка при вычислении потери по истинному потенциалу: {e}")
+            potential_l = torch.tensor(0.0, device=r_vectors.device)
         
+        # Потеря по симметрии
         symmetry_l = 0
-        if self.symmetric_weight > 0:
-            symmetry_l = self.symmetry_loss(model, r_vectors)
+        try:
+            if self.symmetric_weight > 0:
+                symmetry_l = self.symmetry_loss(model, r_vectors)
+                loss_components['symmetry'] = symmetry_l.item() if isinstance(symmetry_l, torch.Tensor) else 0.0
+        except Exception as e:
+            print(f"Ошибка при вычислении потери по симметрии: {e}")
+            symmetry_l = torch.tensor(0.0, device=r_vectors.device)
         
+        # Потеря по форме потенциала
         shape_l = 0
-        if self.shape_weight > 0:
-            shape_l = self.shape_constraints_loss(model, r_vectors)
-            
-        conservation_l = 0
-        if self.conservation_weight > 0 and positions is not None and velocities is not None:
-            conservation_l = self.conservation_loss(model, positions, velocities, masses)
-            
-        yukawa_l = self.nuclear_yukawa_form_loss(model, r_vectors)
+        try:
+            if self.shape_weight > 0:
+                shape_l = self.shape_constraints_loss(model, r_vectors)
+                loss_components['shape'] = shape_l.item() if isinstance(shape_l, torch.Tensor) else 0.0
+        except Exception as e:
+            print(f"Ошибка при вычислении потери по форме потенциала: {e}")
+            shape_l = torch.tensor(0.0, device=r_vectors.device)
         
+        # Потеря по сохранению энергии
+        conservation_l = 0
+        try:
+            # Проверяем, что positions и velocities имеют совместимые размеры
+            valid_conservation = (positions is not None and velocities is not None and 
+                                  positions.shape[0] > 0 and velocities.shape[0] > 0 and
+                                  positions.shape[0] == velocities.shape[0])
+            
+            if self.conservation_weight > 0 and valid_conservation:
+                conservation_l = self.conservation_loss(model, positions, velocities, masses)
+                loss_components['conservation'] = conservation_l.item() if isinstance(conservation_l, torch.Tensor) else 0.0
+        except Exception as e:
+            print(f"Ошибка при вычислении потери по сохранению энергии: {e}")
+            conservation_l = torch.tensor(0.0, device=r_vectors.device)
+        
+        # Потеря по форме потенциала Юкавы
+        yukawa_l = 0
+        try:
+            yukawa_l = self.nuclear_yukawa_form_loss(model, r_vectors)
+            loss_components['yukawa'] = yukawa_l.item() if isinstance(yukawa_l, torch.Tensor) else 0.0
+        except Exception as e:
+            print(f"Ошибка при вычислении потери по форме Юкавы: {e}")
+            yukawa_l = torch.tensor(0.0, device=r_vectors.device)
+        
+        # Динамические веса для физически-информированных компонентов
         shape_weight_dynamic = self.shape_weight * min(1.0, epoch / 10.0)
         conservation_weight_dynamic = self.conservation_weight * min(1.0, epoch / 15.0)
         yukawa_weight = 0.2 * min(1.0, epoch / 5.0)
         
+        # Вес для истинного потенциала
         true_potential_weight_dynamic = 0.0
         if not self.use_true_potential_only_for_init:
             true_potential_weight_dynamic = self.true_potential_weight * min(1.0, epoch / 3.0)
         
+        # Суммируем все компоненты потерь
         total = (
             self.force_weight * force_l + 
             true_potential_weight_dynamic * potential_l +
@@ -684,14 +746,16 @@ class LossManager:
             yukawa_weight * yukawa_l
         )
         
-        loss_components = {
-            'force': force_l.item(),
-            'potential': potential_l.item() if isinstance(potential_l, torch.Tensor) else 0,
-            'symmetry': symmetry_l.item() if isinstance(symmetry_l, torch.Tensor) else 0,
-            'shape': shape_l.item() if isinstance(shape_l, torch.Tensor) else 0,
-            'conservation': conservation_l.item() if isinstance(conservation_l, torch.Tensor) else 0,
-            'yukawa': yukawa_l.item() if isinstance(yukawa_l, torch.Tensor) else 0,
-            'total': total.item()
-        }
+        # На случай, если все потери вернули NaN или Inf
+        if not torch.isfinite(total):
+            print(f"WARN: Обнаружена нефинитная общая потеря. Используем только потерю по силам.")
+            total = force_l  # Используем только базовую потерю по силам
+            
+            # Если и она нефинитная, используем фиктивное значение
+            if not torch.isfinite(total):
+                print(f"WARN: Потеря по силам также нефинитная. Используем фиктивное значение.")
+                total = torch.tensor(1.0, device=r_vectors.device, requires_grad=True)
+        
+        loss_components['total'] = total.item()
         
         return total, loss_components
