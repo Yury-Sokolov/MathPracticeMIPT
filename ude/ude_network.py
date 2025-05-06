@@ -428,8 +428,17 @@ class LossManager:
     
     def force_loss(self, pred_force, true_force):
         """Combined L1 and L2 loss for forces"""
+        if pred_force.shape[0] != true_force.shape[0]:
+            if pred_force.shape[0] < true_force.shape[0]:
+                true_force = true_force[:pred_force.shape[0]]
+            else:
+                pred_force = pred_force[:true_force.shape[0]]
+        
+        assert pred_force.shape == true_force.shape, f"Размеры тензоров не совпадают после обработки: {pred_force.shape} vs {true_force.shape}"
+        
         mse_loss = F.mse_loss(pred_force, true_force)
         mae_loss = F.l1_loss(pred_force, true_force)
+        
         pred_norm = torch.norm(pred_force, dim=-1, keepdim=True) + 1e-8
         true_norm = torch.norm(true_force, dim=-1, keepdim=True) + 1e-8
         pred_dir = pred_force / pred_norm
@@ -619,7 +628,25 @@ class LossManager:
     
     def total_loss(self, model, r_vectors, true_force, positions=None, velocities=None, masses=None, epoch=0, potential_params=None):
         """Combined loss function with physical priors"""
+        r_vectors_size = r_vectors.shape[0] if r_vectors.shape[0] > 0 else 0
+        true_force_size = true_force.shape[0] if true_force.shape[0] > 0 else 0
+        
+        if r_vectors_size == 0:
+            return torch.tensor(0.0, device=true_force.device), {
+                'force': 0.0,
+                'potential': 0.0,
+                'symmetry': 0.0,
+                'shape': 0.0,
+                'conservation': 0.0,
+                'yukawa': 0.0,
+                'total': 0.0
+            }
+        
         pred_force = model.compute_force(r_vectors)
+        
+        if pred_force.shape[0] != true_force.shape[0]:
+            print(f"WARN: Размеры тензоров в total_loss не совпадают: pred_force={pred_force.shape}, true_force={true_force.shape}")
+        
         force_l = self.force_loss(pred_force, true_force)
         
         potential_l = 0

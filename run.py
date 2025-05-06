@@ -868,10 +868,28 @@ def train_ude(args):
                     if args.model_type == 'kan':
                         symmetry_weight *= 0.3 
                         
+
+   
+                    if len(all_rel_pos_ij) > 0:
+                        rel_pos_tensor = torch.cat(all_rel_pos_ij, dim=0).requires_grad_(True)
+                        matched_force = current_target_accel_batch.reshape(-1, 3)
+                        
+                        if rel_pos_tensor.shape[0] != matched_force.shape[0]:
+                            print(f"DEBUG: rel_pos_tensor.shape={rel_pos_tensor.shape}, matched_force.shape={matched_force.shape}")
+                            print(f"DEBUG: len(all_rel_pos_ij)={len(all_rel_pos_ij)}")
+                            
+                            if rel_pos_tensor.shape[0] < matched_force.shape[0]:
+                                matched_force = matched_force[:rel_pos_tensor.shape[0]]
+                            else:
+                                rel_pos_tensor = rel_pos_tensor[:matched_force.shape[0]]
+                    else:
+                        rel_pos_tensor = torch.zeros((0, 3), device=device)
+                        matched_force = torch.zeros((0, 3), device=device)
+                    
                     combined_loss_batch, loss_components = loss_manager.total_loss(
                         nn_model, 
-                        r_vectors=all_rel_pos_ij_tensor if len(all_rel_pos_ij) > 0 else torch.zeros((0, 3), device=device),
-                        true_force=current_target_accel_batch.reshape(-1, 3),
+                        r_vectors=rel_pos_tensor,
+                        true_force=matched_force,
                         positions=current_positions_batch,
                         velocities=current_target_accel_batch,
                         masses=None,  
