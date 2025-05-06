@@ -428,24 +428,39 @@ class LossManager:
     
     def force_loss(self, pred_force, true_force):
         """Combined L1 and L2 loss for forces"""
-        if pred_force.shape[0] != true_force.shape[0]:
-            if pred_force.shape[0] < true_force.shape[0]:
-                true_force = true_force[:pred_force.shape[0]]
-            else:
-                pred_force = pred_force[:true_force.shape[0]]
+        if pred_force.shape != true_force.shape:
+            min_size = min(pred_force.shape[0], true_force.shape[0])
+            pred_force = pred_force[:min_size]
+            true_force = true_force[:min_size]
         
-        assert pred_force.shape == true_force.shape, f"Размеры тензоров не совпадают после обработки: {pred_force.shape} vs {true_force.shape}"
+        pred_force = torch.clamp(pred_force, min=-1e6, max=1e6)
+        true_force = torch.clamp(true_force, min=-1e6, max=1e6)
         
-        mse_loss = F.mse_loss(pred_force, true_force)
+        mse_loss = F.smooth_l1_loss(pred_force, true_force, beta=0.1)
         mae_loss = F.l1_loss(pred_force, true_force)
         
-        pred_norm = torch.norm(pred_force, dim=-1, keepdim=True) + 1e-8
-        true_norm = torch.norm(true_force, dim=-1, keepdim=True) + 1e-8
-        pred_dir = pred_force / pred_norm
-        true_dir = true_force / true_norm
-        direction_loss = 1.0 - F.cosine_similarity(pred_dir, true_dir, dim=-1).mean()
+        pred_norm = torch.norm(pred_force, dim=-1, keepdim=True)
+        true_norm = torch.norm(true_force, dim=-1, keepdim=True)
         
-        return mse_loss + 0.2 * mae_loss + 0.3 * direction_loss
+        epsilon = 1e-6
+        valid_mask = (pred_norm > epsilon) & (true_norm > epsilon)
+        
+        direction_loss = torch.tensor(0.0, device=pred_force.device)
+        
+        if torch.any(valid_mask):
+            pred_dir = torch.zeros_like(pred_force)
+            true_dir = torch.zeros_like(true_force)
+            
+            pred_dir[valid_mask.squeeze(-1)] = pred_force[valid_mask.squeeze(-1)] / pred_norm[valid_mask]
+            true_dir[valid_mask.squeeze(-1)] = true_force[valid_mask.squeeze(-1)] / true_norm[valid_mask]
+            
+            cos_sim = F.cosine_similarity(pred_dir, true_dir, dim=-1)
+            cos_sim = torch.clamp(cos_sim, min=-1.0, max=1.0)  
+            direction_loss = 1.0 - cos_sim[valid_mask.squeeze(-1)].mean()
+        
+        total_loss = mse_loss + 0.2 * mae_loss + 0.3 * direction_loss
+        
+        return total_loss
     
     def symmetry_loss(self, model, r_vectors):
         """Enforce rotational symmetry"""
@@ -459,7 +474,6 @@ class LossManager:
         
         cos_a = torch.cos(angle)
         sin_a = torch.sin(angle)
-        ux, uy, uz = axis[:, 0:1], axis[:, 1:2], axis[:, 2:3]
         
         R = (
             cos_a.unsqueeze(-1) * torch.eye(3, device=r_vectors.device).unsqueeze(0) +
@@ -481,67 +495,98 @@ class LossManager:
         r_norms = torch.norm(r_vectors, dim=1)
         device = r_vectors.device
         
-        total_shape_loss = torch.tensor(0.0, device=device)
+        total_shape_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        loss_components_count = 0
         
         far_mask = r_norms > 3.0
         if torch.any(far_mask):
             far_vectors = r_vectors[far_mask]
             far_potentials = model.compute_potential(far_vectors)
+            far_potentials = torch.clamp(far_potentials, min=-10.0, max=10.0)
             far_loss = torch.mean(far_potentials**2)
-            total_shape_loss = total_shape_loss + 0.5 * far_loss
+            
+            if torch.isfinite(far_loss):
+                total_shape_loss = total_shape_loss + 0.5 * far_loss
+                loss_components_count += 1
         
         close_mask = (r_norms > 0.1) & (r_norms < 0.3)
         if torch.any(close_mask):
             close_vectors = r_vectors[close_mask].clone().requires_grad_(True)
             close_potentials = model.compute_potential(close_vectors)
+            close_potentials = torch.clamp(close_potentials, min=-10.0, max=10.0)
             
             grad_sum = torch.sum(close_potentials)
             grads = torch.autograd.grad(grad_sum, close_vectors, create_graph=True)[0]
             
-            dir_vectors = close_vectors / r_norms[close_mask].unsqueeze(1)
-            grad_radial = torch.sum(grads * dir_vectors, dim=1)
-            
-            repulsive_loss = torch.mean(F.relu(grad_radial))
-            
-            positive_pot_loss = torch.mean(F.relu(-close_potentials))
-            
-            total_shape_loss = total_shape_loss + 2.0 * repulsive_loss + positive_pot_loss
+            if grads is not None:
+                grads = torch.clamp(grads, min=-100.0, max=100.0)
+                
+                safe_norms = torch.clamp(r_norms[close_mask].unsqueeze(1), min=1e-6)
+                dir_vectors = close_vectors / safe_norms
+                
+                grad_radial = torch.sum(grads * dir_vectors, dim=1)
+                
+                repulsive_loss = torch.mean(F.relu(grad_radial))
+                
+                positive_pot_loss = torch.mean(F.relu(-close_potentials))
+                
+                if torch.isfinite(repulsive_loss) and torch.isfinite(positive_pot_loss):
+                    total_shape_loss = total_shape_loss + 2.0 * repulsive_loss + positive_pot_loss
+                    loss_components_count += 1
         
         mid_mask = (r_norms > 0.4) & (r_norms < 0.8)
         if torch.any(mid_mask):
             mid_vectors = r_vectors[mid_mask].clone().requires_grad_(True)
             mid_potentials = model.compute_potential(mid_vectors)
+            mid_potentials = torch.clamp(mid_potentials, min=-10.0, max=10.0)
             
             attraction_loss = torch.mean(F.relu(mid_potentials))
             
             grad_sum = torch.sum(mid_potentials)
             mid_grads = torch.autograd.grad(grad_sum, mid_vectors, create_graph=True)[0]
-            dir_vectors = mid_vectors / r_norms[mid_mask].unsqueeze(1)
-            grad_radial = torch.sum(mid_grads * dir_vectors, dim=1)
             
-            has_positive = torch.any(grad_radial > 0)
-            has_negative = torch.any(grad_radial < 0)
-            
-            if has_positive and has_negative:
-                min_indicator_loss = torch.tensor(0.0, device=device)
-            else:
-                min_indicator_loss = torch.tensor(1.0, device=device)
-            
-            total_shape_loss = total_shape_loss + 0.5 * attraction_loss + 0.5 * min_indicator_loss
+            if mid_grads is not None:
+                mid_grads = torch.clamp(mid_grads, min=-100.0, max=100.0)
+                
+                safe_norms = torch.clamp(r_norms[mid_mask].unsqueeze(1), min=1e-6)
+                dir_vectors = mid_vectors / safe_norms
+                
+                grad_radial = torch.sum(mid_grads * dir_vectors, dim=1)
+                
+                has_positive = torch.any(grad_radial > 0)
+                has_negative = torch.any(grad_radial < 0)
+                
+                min_indicator_loss = torch.tensor(0.0 if has_positive and has_negative else 1.0, device=device)
+                
+                if torch.isfinite(attraction_loss) and torch.isfinite(min_indicator_loss):
+                    total_shape_loss = total_shape_loss + 0.5 * attraction_loss + 0.5 * min_indicator_loss
+                    loss_components_count += 1
         
         decay_mask = r_norms > 1.0
         if torch.any(decay_mask):
             sorted_indices = torch.argsort(r_norms[decay_mask])
             decay_vectors = r_vectors[decay_mask][sorted_indices]
             decay_potentials = model.compute_potential(decay_vectors)
+            decay_potentials = torch.clamp(decay_potentials, min=-10.0, max=10.0)
             
-            diff = decay_potentials[1:] - decay_potentials[:-1]
-            monotonic_decay_loss = torch.mean(F.relu(-diff))
-            
-            smoothness_loss = torch.mean(torch.abs(diff))
-            
-            total_shape_loss = total_shape_loss + 0.5 * monotonic_decay_loss + 0.2 * smoothness_loss
+            if len(decay_potentials) > 1:
+                diff = decay_potentials[1:] - decay_potentials[:-1]
+                monotonic_decay_loss = torch.mean(F.relu(-diff))
+                
+                smoothness_loss = torch.mean(torch.abs(diff))
+                
+                if torch.isfinite(monotonic_decay_loss) and torch.isfinite(smoothness_loss):
+                    total_shape_loss = total_shape_loss + 0.5 * monotonic_decay_loss + 0.2 * smoothness_loss
+                    loss_components_count += 1
         
+        if loss_components_count == 0:
+            return torch.tensor(0.1, device=device, requires_grad=True)
+            
+        total_shape_loss = total_shape_loss / max(1, loss_components_count)
+        
+        if not torch.isfinite(total_shape_loss):
+            return torch.tensor(0.1, device=device, requires_grad=True)
+            
         return total_shape_loss
     
     def conservation_loss(self, model, positions, velocities, masses=None, dt=0.001):
@@ -556,7 +601,6 @@ class LossManager:
             return torch.tensor(0.0, device=positions.device)
         
         rel_positions = positions.reshape(batch_size, n_particles, 1, 3) - positions.reshape(batch_size, 1, n_particles, 3)
-        rel_norms = torch.norm(rel_positions, dim=3)
         
         eye_mask = torch.eye(n_particles, dtype=torch.bool, device=positions.device)
         batch_mask = ~eye_mask.unsqueeze(0).expand(batch_size, n_particles, n_particles)
@@ -572,27 +616,30 @@ class LossManager:
         
         if rel_pos_flat_initial.shape[0] == 0:
             return torch.tensor(0.0, device=positions.device)
+            
+        potential_initial = model.compute_potential(rel_pos_flat_initial)
+        potential_final = model.compute_potential(rel_pos_flat_final)
         
-        try:
-            potential_initial = model.compute_potential(rel_pos_flat_initial)
-            potential_final = model.compute_potential(rel_pos_flat_final)
-            
-            n_pairs = n_particles * (n_particles - 1)
-            potential_initial = potential_initial.reshape(batch_size, n_pairs)
-            potential_final = potential_final.reshape(batch_size, n_pairs)
-            
-            total_potential_initial = torch.sum(potential_initial, dim=1) * 0.5  
-            total_potential_final = torch.sum(potential_final, dim=1) * 0.5
-            
-            total_energy_initial = kinetic_energy + total_potential_initial
-            total_energy_final = kinetic_energy + total_potential_final 
-            
-            energy_diff = torch.abs(total_energy_final - total_energy_initial)
-            conservation_loss = torch.mean(energy_diff)
-            
+        if not (torch.isfinite(potential_initial).all() and torch.isfinite(potential_final).all()):
+            return torch.tensor(0.0, device=positions.device)
+        
+        n_pairs = n_particles * (n_particles - 1)
+        potential_initial = potential_initial.reshape(batch_size, n_pairs)
+        potential_final = potential_final.reshape(batch_size, n_pairs)
+        
+        total_potential_initial = torch.sum(potential_initial, dim=1) * 0.5  
+        total_potential_final = torch.sum(potential_final, dim=1) * 0.5
+        
+        total_energy_initial = kinetic_energy + total_potential_initial
+        total_energy_final = kinetic_energy + total_potential_final 
+        
+        energy_diff = torch.abs(total_energy_final - total_energy_initial)
+        conservation_loss = torch.mean(energy_diff)
+        
+        # Проверка на конечность результата
+        if torch.isfinite(conservation_loss):
             return conservation_loss
-        except Exception as e:
-            print(f"Ошибка при вычислении conservation_loss: {e}")
+        else:
             return torch.tensor(0.0, device=positions.device)
     
     def nuclear_yukawa_form_loss(self, model, r_vectors):
@@ -610,39 +657,52 @@ class LossManager:
         
         potentials = model.compute_potential(valid_r)
         
+        if not torch.isfinite(potentials).all():
+            return torch.tensor(0.0, device=device)
+        
         r_times_v = valid_norms * torch.abs(potentials) + 1e-8
         log_r_times_v = torch.log(r_times_v)
+        
+        total_loss = torch.tensor(0.0, device=device)
+        components_count = 0
         
         small_r_mask = valid_norms < 1.0
         if torch.any(small_r_mask):
             small_r = valid_norms[small_r_mask]
             small_log_rv = log_r_times_v[small_r_mask]
             
-            expected_slope = -3.9
-            expected_values = small_log_rv[0] + expected_slope * (small_r - small_r[0])
-            small_r_loss = F.mse_loss(small_log_rv, expected_values)
-        else:
-            small_r_loss = torch.tensor(0.0, device=device)
-        
+            if len(small_r) > 1:
+                expected_slope = -3.9  
+                expected_values = small_log_rv[0] + expected_slope * (small_r - small_r[0])
+                small_r_loss = F.mse_loss(small_log_rv, expected_values)
+                
+                if torch.isfinite(small_r_loss):
+                    total_loss = total_loss + 0.5 * small_r_loss
+                    components_count += 1
+            
         mid_r_mask = (valid_norms >= 1.0) & (valid_norms <= 3.0)
         if torch.any(mid_r_mask):
             mid_r = valid_norms[mid_r_mask]
             mid_log_rv = log_r_times_v[mid_r_mask]
             
-            expected_slope = -0.7
-            expected_values = mid_log_rv[0] + expected_slope * (mid_r - mid_r[0])
-            mid_r_loss = F.mse_loss(mid_log_rv, expected_values)
-        else:
-            mid_r_loss = torch.tensor(0.0, device=device)
+            if len(mid_r) > 1:
+                expected_slope = -0.7 
+                expected_values = mid_log_rv[0] + expected_slope * (mid_r - mid_r[0])
+                mid_r_loss = F.mse_loss(mid_log_rv, expected_values)
+                
+                if torch.isfinite(mid_r_loss):
+                    total_loss = total_loss + 0.5 * mid_r_loss
+                    components_count += 1
         
-        return 0.5 * small_r_loss + 0.5 * mid_r_loss
+        if components_count == 0:
+            return torch.tensor(0.0, device=device)
+            
+        return total_loss / components_count
     
     def total_loss(self, model, r_vectors, true_force, positions=None, velocities=None, masses=None, epoch=0, potential_params=None):
         """Combined loss function with physical priors"""
         r_vectors_size = r_vectors.shape[0] if r_vectors.shape[0] > 0 else 0
-        true_force_size = true_force.shape[0] if true_force.shape[0] > 0 else 0
         
-        # Инициализируем словарь компонентов потерь
         loss_components = {
             'force': 0.0,
             'potential': 0.0,
@@ -653,90 +713,50 @@ class LossManager:
             'total': 0.0
         }
         
-        # Если r_vectors пустой, то нельзя вычислить потери на основе сил
         if r_vectors_size == 0:
             return torch.tensor(0.0, device=true_force.device), loss_components
         
-        # Вычисляем потерю по силам (основная потеря)
-        try:
-            # Вычисляем силы для всех входных векторов
-            pred_force = model.compute_force(r_vectors)
-            
-            # Если размеры не совпадают, выводим предупреждение с размерами тензоров
-            if pred_force.shape[0] != true_force.shape[0]:
-                print(f"WARN: Размеры тензоров в total_loss не совпадают: pred_force={pred_force.shape}, true_force={true_force.shape}")
-            
-            force_l = self.force_loss(pred_force, true_force)
-            loss_components['force'] = force_l.item() if isinstance(force_l, torch.Tensor) else 0.0
-        except Exception as e:
-            print(f"Ошибка при вычислении потери по силам: {e}")
-            force_l = torch.tensor(0.0, device=r_vectors.device)
+        pred_force = model.compute_force(r_vectors)
         
-        # Потеря по истинному потенциалу
-        potential_l = 0
-        try:
-            if not self.use_true_potential_only_for_init and self.true_potential_weight > 0 and (self.true_potential_model is not None or potential_params is not None):
-                potential_l = self.true_potential_loss(model, r_vectors, potential_params, initialization_only=False)
-                loss_components['potential'] = potential_l.item() if isinstance(potential_l, torch.Tensor) else 0.0
-        except Exception as e:
-            print(f"Ошибка при вычислении потери по истинному потенциалу: {e}")
-            potential_l = torch.tensor(0.0, device=r_vectors.device)
+        force_l = self.force_loss(pred_force, true_force)
+        loss_components['force'] = force_l.item() if isinstance(force_l, torch.Tensor) else 0.0
         
-        # Потеря по симметрии
-        symmetry_l = 0
-        try:
-            if self.symmetric_weight > 0:
-                symmetry_l = self.symmetry_loss(model, r_vectors)
-                loss_components['symmetry'] = symmetry_l.item() if isinstance(symmetry_l, torch.Tensor) else 0.0
-        except Exception as e:
-            print(f"Ошибка при вычислении потери по симметрии: {e}")
-            symmetry_l = torch.tensor(0.0, device=r_vectors.device)
+        potential_l = torch.tensor(0.0, device=r_vectors.device)
+        if not self.use_true_potential_only_for_init and self.true_potential_weight > 0 and (self.true_potential_model is not None or potential_params is not None):
+            potential_l = self.true_potential_loss(model, r_vectors, potential_params, initialization_only=False)
+            loss_components['potential'] = potential_l.item() if isinstance(potential_l, torch.Tensor) else 0.0
         
-        # Потеря по форме потенциала
-        shape_l = 0
-        try:
-            if self.shape_weight > 0:
-                shape_l = self.shape_constraints_loss(model, r_vectors)
-                loss_components['shape'] = shape_l.item() if isinstance(shape_l, torch.Tensor) else 0.0
-        except Exception as e:
-            print(f"Ошибка при вычислении потери по форме потенциала: {e}")
-            shape_l = torch.tensor(0.0, device=r_vectors.device)
+        symmetry_l = torch.tensor(0.0, device=r_vectors.device)
+        if self.symmetric_weight > 0:
+            symmetry_l = self.symmetry_loss(model, r_vectors)
+            loss_components['symmetry'] = symmetry_l.item() if isinstance(symmetry_l, torch.Tensor) else 0.0
         
-        # Потеря по сохранению энергии
-        conservation_l = 0
-        try:
-            # Проверяем, что positions и velocities имеют совместимые размеры
-            valid_conservation = (positions is not None and velocities is not None and 
-                                  positions.shape[0] > 0 and velocities.shape[0] > 0 and
-                                  positions.shape[0] == velocities.shape[0])
-            
-            if self.conservation_weight > 0 and valid_conservation:
-                conservation_l = self.conservation_loss(model, positions, velocities, masses)
-                loss_components['conservation'] = conservation_l.item() if isinstance(conservation_l, torch.Tensor) else 0.0
-        except Exception as e:
-            print(f"Ошибка при вычислении потери по сохранению энергии: {e}")
-            conservation_l = torch.tensor(0.0, device=r_vectors.device)
+        shape_l = torch.tensor(0.0, device=r_vectors.device)
+        if self.shape_weight > 0:
+            shape_l = self.shape_constraints_loss(model, r_vectors)
+            loss_components['shape'] = shape_l.item() if isinstance(shape_l, torch.Tensor) else 0.0
         
-        # Потеря по форме потенциала Юкавы
-        yukawa_l = 0
-        try:
-            yukawa_l = self.nuclear_yukawa_form_loss(model, r_vectors)
-            loss_components['yukawa'] = yukawa_l.item() if isinstance(yukawa_l, torch.Tensor) else 0.0
-        except Exception as e:
-            print(f"Ошибка при вычислении потери по форме Юкавы: {e}")
-            yukawa_l = torch.tensor(0.0, device=r_vectors.device)
+        conservation_l = torch.tensor(0.0, device=r_vectors.device)
+        valid_conservation = (positions is not None and velocities is not None and 
+                             positions.shape[0] > 0 and velocities.shape[0] > 0 and
+                             positions.shape[0] == velocities.shape[0])
         
-        # Динамические веса для физически-информированных компонентов
+        if self.conservation_weight > 0 and valid_conservation:
+            conservation_l = self.conservation_loss(model, positions, velocities, masses)
+            loss_components['conservation'] = conservation_l.item() if isinstance(conservation_l, torch.Tensor) else 0.0
+        
+        yukawa_l = torch.tensor(0.0, device=r_vectors.device)
+        yukawa_l = self.nuclear_yukawa_form_loss(model, r_vectors)
+        loss_components['yukawa'] = yukawa_l.item() if isinstance(yukawa_l, torch.Tensor) else 0.0
+        
         shape_weight_dynamic = self.shape_weight * min(1.0, epoch / 10.0)
         conservation_weight_dynamic = self.conservation_weight * min(1.0, epoch / 15.0)
         yukawa_weight = 0.2 * min(1.0, epoch / 5.0)
         
-        # Вес для истинного потенциала
         true_potential_weight_dynamic = 0.0
         if not self.use_true_potential_only_for_init:
             true_potential_weight_dynamic = self.true_potential_weight * min(1.0, epoch / 3.0)
         
-        # Суммируем все компоненты потерь
         total = (
             self.force_weight * force_l + 
             true_potential_weight_dynamic * potential_l +
@@ -746,14 +766,9 @@ class LossManager:
             yukawa_weight * yukawa_l
         )
         
-        # На случай, если все потери вернули NaN или Inf
         if not torch.isfinite(total):
-            print(f"WARN: Обнаружена нефинитная общая потеря. Используем только потерю по силам.")
-            total = force_l  # Используем только базовую потерю по силам
-            
-            # Если и она нефинитная, используем фиктивное значение
+            total = force_l
             if not torch.isfinite(total):
-                print(f"WARN: Потеря по силам также нефинитная. Используем фиктивное значение.")
                 total = torch.tensor(1.0, device=r_vectors.device, requires_grad=True)
         
         loss_components['total'] = total.item()

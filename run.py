@@ -686,6 +686,7 @@ def train_ude(args):
     losses = []
     val_losses = []
     force_profile_history = []
+    loss_components_history = []
     
     print(f"Starting training for {args.epochs} epochs...")
     num_steps_loss = normalized_accel.shape[0]
@@ -826,9 +827,11 @@ def train_ude(args):
                                                           device=device)
                         
                         all_rel_pos_ij = []
+                        all_true_forces = []
                         
                         for b_idx in range(batch_actual_size):
                             instance_positions = current_positions_batch[b_idx]
+                            instance_target_accel = current_target_accel_batch[b_idx]
                             instance_pairs = pair_indices_batch[b_idx]
                             
                             for p_idx in range(0, len(instance_pairs), 2):
@@ -841,12 +844,19 @@ def train_ude(args):
                                 pos_j = instance_positions[j_idx]
                                 rel_pos_ij = pos_i - pos_j
                                 r_norm = torch.norm(rel_pos_ij)
+                                
+                                accel_i = instance_target_accel[i_idx]
+                                accel_j = instance_target_accel[j_idx]
+
+                                rel_force = accel_i
 
                                 if r_norm > 1e-6:
                                     all_rel_pos_ij.append(rel_pos_ij.unsqueeze(0))
+                                    all_true_forces.append(rel_force.unsqueeze(0))
 
                         if len(all_rel_pos_ij) > 0:
                             all_rel_pos_ij_tensor = torch.cat(all_rel_pos_ij, dim=0).requires_grad_(True)
+                            all_true_forces_tensor = torch.cat(all_true_forces, dim=0)
                             
                             symmetry_loss_tensor = loss_manager.symmetry_loss(nn_model, all_rel_pos_ij_tensor)
                         else: 
@@ -868,43 +878,49 @@ def train_ude(args):
                     if args.model_type == 'kan':
                         symmetry_weight *= 0.3 
                         
-
-   
+                    rel_pos_tensor = torch.zeros((0, 3), device=device)
+                    matched_force = torch.zeros((0, 3), device=device)
+                    
                     if len(all_rel_pos_ij) > 0:
-                        rel_pos_tensor = torch.cat(all_rel_pos_ij, dim=0).requires_grad_(True)
-                        matched_force = current_target_accel_batch.reshape(-1, 3)
+                        rel_pos_tensor = torch.cat(all_rel_pos_ij, dim=0)
+                        matched_force = torch.cat(all_true_forces, dim=0)
                         
                         if rel_pos_tensor.shape[0] != matched_force.shape[0]:
-                            print(f"DEBUG: rel_pos_tensor.shape={rel_pos_tensor.shape}, matched_force.shape={matched_force.shape}")
-                            print(f"DEBUG: len(all_rel_pos_ij)={len(all_rel_pos_ij)}")
-                            
-                            if rel_pos_tensor.shape[0] < matched_force.shape[0]:
-                                matched_force = matched_force[:rel_pos_tensor.shape[0]]
+                            print(f"ВНИМАНИЕ: Несоответствие размеров: rel_pos={rel_pos_tensor.shape}, force={matched_force.shape}")
+                            min_size = min(rel_pos_tensor.shape[0], matched_force.shape[0])
+                            rel_pos_tensor = rel_pos_tensor[:min_size]
+                            matched_force = matched_force[:min_size]
+                        
+                        if (torch.isnan(rel_pos_tensor).any() or torch.isnan(matched_force).any() or
+                            torch.isinf(rel_pos_tensor).any() or torch.isinf(matched_force).any()):
+                            print("ВНИМАНИЕ: Обнаружены NaN или Inf значения в векторах расстояний или сил!")
+                            valid_mask = ~(torch.isnan(rel_pos_tensor).any(dim=1) | torch.isinf(rel_pos_tensor).any(dim=1) |
+                                           torch.isnan(matched_force).any(dim=1) | torch.isinf(matched_force).any(dim=1))
+                            if valid_mask.any():
+                                rel_pos_tensor = rel_pos_tensor[valid_mask]
+                                matched_force = matched_force[valid_mask]
                             else:
-                                rel_pos_tensor = rel_pos_tensor[:matched_force.shape[0]]
-                    else:
-                        rel_pos_tensor = torch.zeros((0, 3), device=device)
-                        matched_force = torch.zeros((0, 3), device=device)
+                                rel_pos_tensor = torch.zeros((0, 3), device=device)
+                                matched_force = torch.zeros((0, 3), device=device)
                     
-                    if current_positions_batch.shape[0] != matched_force.shape[0]:
-                        if len(all_rel_pos_ij) > 0: 
-                            target_batch_size = rel_pos_tensor.shape[0]
-                            if current_positions_batch.shape[0] > target_batch_size:
-                                positions_for_loss = current_positions_batch[:target_batch_size]
-                                velocities_for_loss = current_target_accel_batch[:target_batch_size]
-                            else:
-                                repeat_factor = (target_batch_size + current_positions_batch.shape[0] - 1) // current_positions_batch.shape[0]
-                                positions_for_loss = current_positions_batch.repeat(repeat_factor, 1, 1)[:target_batch_size]
-                                velocities_for_loss = current_target_accel_batch.repeat(repeat_factor, 1, 1)[:target_batch_size]
-                                
-                            assert positions_for_loss.shape[0] == rel_pos_tensor.shape[0], \
-                                f"Размеры все еще не совпадают: positions={positions_for_loss.shape[0]}, rel_pos={rel_pos_tensor.shape[0]}"
-                        else:
-                            positions_for_loss = torch.zeros((0, current_positions_batch.shape[1], 3), device=device)
-                            velocities_for_loss = torch.zeros((0, current_target_accel_batch.shape[1], 3), device=device)
-                    else:
-                        positions_for_loss = current_positions_batch
-                        velocities_for_loss = current_target_accel_batch
+                    positions_for_loss = current_positions_batch
+                    velocities_for_loss = current_target_accel_batch
+                    
+                    if positions_for_loss.shape[0] == 0 or velocities_for_loss.shape[0] == 0:
+                        positions_for_loss = torch.zeros((0, n_particles, 3), device=device)
+                        velocities_for_loss = torch.zeros((0, n_particles, 3), device=device)
+                    
+                    if positions_for_loss.shape[0] != velocities_for_loss.shape[0]:
+                        print(f"ВНИМАНИЕ: Несоответствие размеров в батче: positions={positions_for_loss.shape[0]}, velocities={velocities_for_loss.shape[0]}")
+                        min_batch_size = min(positions_for_loss.shape[0], velocities_for_loss.shape[0])
+                        positions_for_loss = positions_for_loss[:min_batch_size]
+                        velocities_for_loss = velocities_for_loss[:min_batch_size]
+                    
+                    if (torch.isnan(positions_for_loss).any() or torch.isnan(velocities_for_loss).any() or
+                        torch.isinf(positions_for_loss).any() or torch.isinf(velocities_for_loss).any()):
+                        print("ВНИМАНИЕ: Обнаружены NaN или Inf значения в positions или velocities!")
+                        positions_for_loss = torch.nan_to_num(positions_for_loss, nan=0.0, posinf=1e6, neginf=-1e6)
+                        velocities_for_loss = torch.nan_to_num(velocities_for_loss, nan=0.0, posinf=1e6, neginf=-1e6)
                     
                     combined_loss_batch, loss_components = loss_manager.total_loss(
                         nn_model, 
@@ -918,8 +934,13 @@ def train_ude(args):
                     )
                 
                 accumulation_scale = 1.0 / actual_accumulation_steps
+                
+                if not torch.isfinite(combined_loss_batch):
+                    print(f"ПРЕДУПРЕЖДЕНИЕ: Нефизичное значение потери: {combined_loss_batch.item() if isinstance(combined_loss_batch, torch.Tensor) else combined_loss_batch}")
+                    combined_loss_batch = mse_loss_batch
+                
                 scaled_loss = combined_loss_batch * accumulation_scale
-                scaled_loss.backward() 
+                scaled_loss.backward()
                 
                 batch_mse_loss += mse_loss_batch.item() * accumulation_scale
                 batch_symmetry_loss += symmetry_loss_tensor.item() * accumulation_scale 
@@ -1027,6 +1048,8 @@ def train_ude(args):
         
         train_losses_epoch.append(avg_epoch_loss)
         val_losses_epoch.append(avg_val_loss)
+        
+        loss_components_history.append(dict(loss_components))
         
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_epoch_loss:.6f}, Val Loss: {avg_val_loss:.6f}, " 
               f"MSE: {avg_epoch_mse:.6f}, Sym: {avg_epoch_sym:.6f}, "
