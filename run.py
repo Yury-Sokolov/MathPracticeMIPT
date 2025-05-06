@@ -389,7 +389,7 @@ def train_ude(args):
     print("Pre-initializing weights to match true potential curve...")
     r_cutoff = potential_params.get('r_cutoff', 5.0)
     
-    test_dists_close = torch.linspace(0.2, 1.0, 30, device=device)
+    test_dists_close = torch.linspace(0.0001, 1.0, 30, device=device)
     test_dists_far = torch.linspace(1.0, r_cutoff, 30, device=device)
     test_dists = torch.cat([test_dists_close, test_dists_far[1:]])
     
@@ -414,7 +414,7 @@ def train_ude(args):
     init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
     
     print("Pre-training neural network...")
-    for pre_epoch in tqdm(range(3), desc="Pre-training"):
+    for pre_epoch in tqdm(range(30), desc="Pre-training"):
         init_optimizer.zero_grad()
         
         with torch.enable_grad():
@@ -1481,20 +1481,20 @@ if __name__ == "__main__":
     parser.add_argument('--model_load_path', type=str, default=None, help='Path to load the model for analysis (defaults to model_save_path if not provided)')
     parser.add_argument('--data_file', type=str, default='./data/ude_data.pt', help='Path to save/load the generated data')
     parser.add_argument('--analysis_output_dir', type=str, default='./analysis', help='Directory to save analysis output files')
-    parser.add_argument('--g_att', type=float, default=7.0, help='Attractive coupling constant')
-    parser.add_argument('--g_rep', type=float, default=10.0, help='Repulsive coupling constant')
+    parser.add_argument('--g_att', type=float, default=13.5, help='Attractive coupling constant')
+    parser.add_argument('--g_rep', type=float, default=20.0, help='Repulsive coupling constant')
     parser.add_argument('--m_pi', type=float, default=0.7, help='Pion mass parameter')
-    parser.add_argument('--m_rho', type=float, default=3.5, help='Rho mass parameter')
+    parser.add_argument('--m_rho', type=float, default=3.93, help='Rho mass parameter')
     parser.add_argument('--r_cutoff', type=float, default=5.0, help='Cutoff radius for potential')
-    parser.add_argument('--r_core', type=float, default=0.5, help='Repulsive core radius')
+    parser.add_argument('--r_core', type=float, default=0.3, help='Repulsive core radius')
     parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate for NN training')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for regularization')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping value')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training. Set to 0 for auto-determination.')
     parser.add_argument('--batch_accumulation_steps', type=int, default=4, help='Number of batches to accumulate gradients for (reduces memory usage)')
-    parser.add_argument('--nn_hidden_dim', type=int, default=16, help='Hidden dimension of the neural network')
-    parser.add_argument('--num_residual_blocks', type=int, default=4, help='Number of residual blocks in the neural network')
+    parser.add_argument('--nn_hidden_dim', type=int, default=32, help='Hidden dimension of the neural network')
+    parser.add_argument('--num_residual_blocks', type=int, default=2, help='Number of residual blocks in the neural network')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to run on')
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
     parser.add_argument('--wandb_project', type=str, default='physics-ude', help='Weights & Biases project name')
