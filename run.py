@@ -388,8 +388,8 @@ def train_ude(args):
     print("Pre-initializing weights to match true potential curve...")
     r_cutoff = potential_params.get('r_cutoff', 5.0)
     
-    test_dists_close = torch.linspace(0.01, 1.0, 40, device=device)
-    test_dists_far = torch.linspace(1.0, r_cutoff, 40, device=device)
+    test_dists_close = torch.linspace(0.01, 1.0, 1000, device=device)
+    test_dists_far = torch.linspace(1.0, r_cutoff, 1000, device=device)
     test_dists = torch.cat([test_dists_close, test_dists_far[1:]])
     
     test_vectors = torch.zeros((len(test_dists), 3), device=device)
