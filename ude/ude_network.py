@@ -301,10 +301,10 @@ class KANPotentialModel(nn.Module):
 class LossManager:
     """Class to handle different loss functions and combinations"""
     def __init__(self, potential_weight=1.0, force_weight=1.0, 
-                 smoothness_weight=0.1, symmetric_weight=0.5):
+                 smoothness_weight=0.0, symmetric_weight=0.5):
         self.potential_weight = potential_weight
         self.force_weight = force_weight
-        self.smoothness_weight = smoothness_weight
+        self.smoothness_weight = 0.0  # Всегда устанавливаем в 0
         self.symmetric_weight = symmetric_weight
         
     def potential_loss(self, pred_potential, true_potential):
@@ -324,27 +324,8 @@ class LossManager:
         return mse_loss + 0.2 * mae_loss + 0.3 * direction_loss
     
     def smoothness_loss(self, model, r_vectors):
-        """Regularization to ensure smooth potentials using Jacobian trace"""
-        if r_vectors.shape[0] == 0:
-            return torch.tensor(0.0, device=r_vectors.device)
-            
-        r_vectors_grad = r_vectors.clone().requires_grad_(True)
-        forces = model.compute_force(r_vectors_grad)
-        
-        divergence = 0.0
-        for i in range(r_vectors.shape[1]):
-            v = torch.zeros_like(forces)
-            v[:, i] = 1.0
-            grad_outputs = torch.autograd.grad(
-                forces,
-                r_vectors_grad,
-                grad_outputs=v,
-                create_graph=True,
-                retain_graph=True
-            )[0]
-            divergence += grad_outputs[:, i]
-        
-        return torch.mean(divergence**2)
+
+        return torch.tensor(0.0, device=r_vectors.device)
     
     def symmetry_loss(self, model, r_vectors):
         """Enforce rotational symmetry"""
@@ -386,9 +367,7 @@ class LossManager:
             potential_l = self.potential_loss(pred_potential, true_potential)
         
         smoothness_l = 0
-        if self.smoothness_weight > 0:
-            smoothness_l = self.smoothness_loss(model, r_vectors)
-            
+        
         symmetry_l = 0
         if self.symmetric_weight > 0:
             symmetry_l = self.symmetry_loss(model, r_vectors)
@@ -403,7 +382,7 @@ class LossManager:
         loss_components = {
             'force': force_l.item(),
             'potential': potential_l.item() if isinstance(potential_l, torch.Tensor) else 0,
-            'smoothness': smoothness_l.item() if isinstance(smoothness_l, torch.Tensor) else 0,
+            'smoothness': 0.0, 
             'symmetry': symmetry_l.item() if isinstance(symmetry_l, torch.Tensor) else 0,
             'total': total.item()
         }

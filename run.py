@@ -237,7 +237,8 @@ def train_ude(args):
             'clip_grad': args.clip_grad,
             'patience': args.patience,
             'model_type': args.model_type,
-            'device': args.device
+            'device': args.device,
+            'smoothness_weight': 0.0
         }
         
         run = wandb.init(
@@ -382,7 +383,7 @@ def train_ude(args):
     loss_manager = LossManager(
         potential_weight=0.5,
         force_weight=1.0,
-        smoothness_weight=args.smoothness_weight,
+        smoothness_weight=0.0,
         symmetric_weight=args.symmetry_weight
     )
     
@@ -785,17 +786,17 @@ def train_ude(args):
                     if epoch < args.epochs // 10:
                         mse_weight = 1.0
                         symmetry_weight = args.symmetry_weight * 0.2
-                        smoothness_weight = args.smoothness_weight * 0.2
+                        smoothness_weight = 0.0
                         force_magnitude_weight = 0.2
                     elif epoch > args.epochs * 0.8:
                         mse_weight = 0.8
                         symmetry_weight = args.symmetry_weight * 1.5
-                        smoothness_weight = args.smoothness_weight * 1.5
+                        smoothness_weight = 0.0
                         force_magnitude_weight = 1.5
                     else:
                         mse_weight = 1.0
                         symmetry_weight = args.symmetry_weight
-                        smoothness_weight = args.smoothness_weight
+                        smoothness_weight = 0.0
                         force_magnitude_weight = 1.0
                     
                     if zero_force_counter > 1:
@@ -1522,7 +1523,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_potential', type=float, default=50.0, help='Maximum potential value for scaling in the PotentialNN model (reduced).')
     parser.add_argument('--model_type', type=str, default='potential_nn', choices=['potential_nn', 'kan'], help='Type of neural network model to use.')
     parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout rate for the PotentialNN model.')
-    parser.add_argument('--smoothness_weight', type=float, default=0.1, help='Weight for smoothness loss in the physics-informed loss function.')
+    parser.add_argument('--smoothness_weight', type=float, default=0.0, help='Weight for smoothness loss in the physics-informed loss function.')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'adam', 'sgd'], help='Optimizer to use.')
     parser.add_argument('--scheduler_type', type=str, default='one_cycle', choices=['one_cycle', 'cosine', 'reduce_on_plateau'], help='Scheduler type to use.')
     parser.add_argument('--plot_results', action='store_true', help='Create plots of results')
