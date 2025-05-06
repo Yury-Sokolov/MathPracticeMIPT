@@ -238,7 +238,9 @@ def train_ude(args):
             'patience': args.patience,
             'model_type': args.model_type,
             'device': args.device,
-            'skip_initialization': args.skip_initialization
+            'skip_initialization': args.skip_initialization,
+            'use_true_potential_in_training': args.use_true_potential_in_training,
+            'true_potential_weight': args.true_potential_weight
         }
         
         run = wandb.init(
@@ -383,12 +385,35 @@ def train_ude(args):
     loss_manager = LossManager(
         potential_weight=0.5,
         force_weight=1.0,
-        symmetric_weight=args.symmetry_weight
+        symmetric_weight=args.symmetry_weight,
+        shape_weight=0.3,
+        conservation_weight=0.2,
+        true_potential_weight=args.true_potential_weight,
+        use_true_potential_only_for_init=not args.use_true_potential_in_training
     )
+    
+    loss_manager.set_true_potential(true_potential)
+    
+    if args.use_true_potential_in_training:
+        print(f"Истинный потенциал будет использоваться во время обучения с весом: {args.true_potential_weight}")
+        if args.use_wandb:
+            wandb.config.update({'use_true_potential_in_training': True})
+    else:
+        print("Истинный потенциал будет использоваться только для инициализации модели, но не при обучении")
+        if args.use_wandb:
+            wandb.config.update({'use_true_potential_in_training': False})
+    
+    print("\nИспользуемые компоненты физически информированных потерь:")
+    print(f"  * Симметрия (symmetry): {args.symmetry_weight}")
+    print(f"  * Форма потенциала (shape): {0.3}")
+    print(f"  * Сохранение энергии (conservation): {0.2}")
+    print(f"  * Форма Юкавы (yukawa): динамический вес до 0.2")
     
     if not args.skip_initialization:
         print("Pre-initializing weights to match true potential curve...")
         r_cutoff = potential_params.get('r_cutoff', 5.0)
+        
+        loss_manager.enable_initialization_mode()
         
         test_dists_close = torch.linspace(0.01, 1.0, 1000, device=device)
         test_dists_far = torch.linspace(1.0, r_cutoff, 1000, device=device)
@@ -397,22 +422,26 @@ def train_ude(args):
         test_vectors = torch.zeros((len(test_dists), 3), device=device)
         test_vectors[:, 0] = test_dists
         
-        g_att = potential_params['g_att']
-        g_rep = potential_params['g_rep']
-        m_pi = potential_params['m_pi']
-        m_rho = potential_params['m_rho']
+        r_tensor = test_dists.unsqueeze(1)
+        true_potential_values = true_potential.compute(r_tensor).squeeze()
         
-        true_potential_values = g_rep * torch.exp(-m_rho*test_dists) / test_dists - g_att * torch.exp(-m_pi*test_dists) / test_dists
-        true_potential_values -= torch.min(true_potential_values)
+        true_min = torch.min(true_potential_values)
+        true_potential_values = true_potential_values - true_min
+        
+        max_cutoff = 10.0
+        true_potential_values = torch.clamp(true_potential_values, max=max_cutoff)
 
-        term1 = g_rep * torch.exp(-m_rho*test_dists) * (m_rho/test_dists + 1/(test_dists**2))
-        term2 = g_att * torch.exp(-m_pi*test_dists) * (m_pi/test_dists + 1/(test_dists**2))
-        true_force_magnitudes = term1 - term2
-        
         true_forces = torch.zeros_like(test_vectors)
-        true_forces[:, 0] = true_force_magnitudes
+        for i, r_vec in enumerate(test_vectors):
+            r_pair = torch.stack([r_vec, -r_vec])
+            force_pair = true_potential.compute_force_only(r_pair)
+            true_forces[i] = force_pair[0]  
+            
+        true_force_magnitudes = torch.norm(true_forces, dim=1)
+        true_force_magnitudes = torch.clamp(true_force_magnitudes, min=-100.0, max=100.0)
         
-        init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
+        lr_init = 0.005 if args.model_type == 'kan' else 0.01
+        init_optimizer = optim.Adam(init_model.parameters(), lr=lr_init)
         
         print("Pre-training neural network...")
         for pre_epoch in tqdm(range(30), desc="Pre-training"):
@@ -423,6 +452,7 @@ def train_ude(args):
                 
                 if args.model_type == 'kan':
                     pred_potentials = init_model.compute_potential(test_vectors_clone)
+                    
                     pred_min = torch.min(pred_potentials)
                     pred_potentials = pred_potentials - pred_min
                     
@@ -430,29 +460,47 @@ def train_ude(args):
                     max_pred = torch.max(pred_potentials.detach())
                     
                     if max_pred > 1e-6:
-                        pred_scale = max_true / max_pred
+                        pred_scale = torch.clamp(max_true / max_pred, min=0.01, max=100.0)
                     else:
                         pred_scale = 1.0
                         
                     pred_potentials_scaled = pred_potentials * pred_scale
-                    pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
+                    
+                    pot_loss = F.smooth_l1_loss(pred_potentials_scaled, true_potential_values)
 
                     total_potential_sum = torch.sum(pred_potentials_scaled)
-                    pred_forces = -torch.autograd.grad(
-                        total_potential_sum, test_vectors_clone,
-                        create_graph=True, retain_graph=True
-                    )[0]
-                    
-                    weights = 1.0 / (test_dists.detach() + 0.5)
-                    weights = weights / weights.sum() 
-                    force_diff = (pred_forces - true_forces) ** 2
-                    force_loss = torch.sum(weights.unsqueeze(1) * force_diff) 
+                    try:
+                        pred_forces = -torch.autograd.grad(
+                            total_potential_sum, test_vectors_clone,
+                            create_graph=True, retain_graph=True
+                        )[0]
+                        
+                        weights = 1.0 / (test_dists.detach() + 0.5)
+                        weights = weights / weights.sum() 
+                        
+                        force_diff = torch.abs(pred_forces - true_forces)
+                        huber_mask = force_diff < 1.0
+                        force_loss_terms = torch.where(
+                            huber_mask,
+                            0.5 * force_diff ** 2,
+                            force_diff - 0.5
+                        )
+                        force_loss = torch.sum(weights.unsqueeze(1) * force_loss_terms)
+                    except RuntimeError:
+                        print("Warning: Error in gradient computation, using zero force loss for this step")
+                        force_loss = torch.tensor(0.0, device=device)
 
-                    combined_loss = pot_loss + 5.0 * force_loss 
-                    combined_loss.backward()
+                    combined_loss = pot_loss + 2.0 * force_loss 
                     
-                    total_pot_loss = pot_loss.item()
-                    total_force_loss = force_loss.item()
+                    if torch.isfinite(combined_loss):
+                        combined_loss.backward()
+                    else:
+                        print(f"Warning: Non-finite loss detected: {combined_loss.item()}")
+                        alt_loss = torch.tensor(1.0, device=device, requires_grad=True)
+                        alt_loss.backward()
+                    
+                    total_pot_loss = pot_loss.item() if torch.isfinite(pot_loss) else float('nan')
+                    total_force_loss = force_loss.item() if torch.isfinite(force_loss) else float('nan')
                 else:
                     pred_potentials = init_model.compute_potential(test_vectors_clone)
                     
@@ -480,11 +528,30 @@ def train_ude(args):
                     total_pot_loss = pot_loss.item()
                     total_force_loss = force_loss.item()
             
-            torch.nn.utils.clip_grad_norm_(init_model.parameters(), 1.0)
-            init_optimizer.step()
+            max_grad_norm = 0.5 if args.model_type == 'kan' else 1.0
+            torch.nn.utils.clip_grad_norm_(init_model.parameters(), max_grad_norm)
+            
+            valid_grads = True
+            for p in init_model.parameters():
+                if p.grad is not None:
+                    if not torch.all(torch.isfinite(p.grad)):
+                        valid_grads = False
+                        p.grad.data.zero_()
+            
+            if valid_grads:
+                init_optimizer.step()
+            else:
+                print("Warning: Invalid gradients detected, skipping update")
+                
+            if args.model_type == 'kan':
+                with torch.no_grad():
+                    for p in init_model.parameters():
+                        p.data.clamp_(-10.0, 10.0)
             
             if args.model_type == 'kan':
                 print(f"  Pre-train epoch {pre_epoch+1}: Pot Loss={total_pot_loss:.6f}, Force Loss={total_force_loss:.6f}")
+        
+        loss_manager.disable_initialization_mode()
         
         with torch.no_grad():
             if args.model_type == 'kan':
@@ -492,21 +559,45 @@ def train_ude(args):
                 batch_size = 8
                 for i in range(0, len(test_vectors), batch_size):
                     batch_vectors = test_vectors[i:i+batch_size]
-                    batch_potentials = init_model.compute_potential(batch_vectors)
-                    pred_potentials.append(batch_potentials)
-                pred_potentials = torch.cat(pred_potentials, dim=0)
+                    try:
+                        batch_potentials = init_model.compute_potential(batch_vectors)
+                        pred_potentials.append(batch_potentials)
+                    except RuntimeError as e:
+                        print(f"Error in KAN prediction, batch {i}: {e}")
+                        pred_potentials.append(torch.zeros(len(batch_vectors), device=device))
+                
+                try:
+                    pred_potentials = torch.cat(pred_potentials, dim=0)
+                except RuntimeError:
+                    print("Error concatenating predictions, using zeros")
+                    pred_potentials = torch.zeros_like(test_dists)
             else:
                 pred_potentials = init_model.compute_potential(test_vectors)
                 
-            pred_min = torch.min(pred_potentials)
-            pred_potentials = pred_potentials - pred_min
-            pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials)
-            pred_potentials_scaled = pred_potentials * pred_scale
+            if torch.all(torch.isfinite(pred_potentials)):
+                pred_min = torch.min(pred_potentials)
+                pred_potentials = pred_potentials - pred_min
+                
+                max_pred = torch.max(pred_potentials)
+                if max_pred > 1e-6:
+                    pred_scale = torch.max(true_potential_values) / max_pred
+                    pred_scale = torch.clamp(pred_scale, min=0.01, max=100.0)
+                    pred_potentials_scaled = pred_potentials * pred_scale
+                    
+                    pot_error = F.mse_loss(pred_potentials_scaled, true_potential_values).item()
+                    print(f"Pre-trained potential error: {pot_error:.6f}")
+                else:
+                    print("Warning: Maximum predicted potential is too small")
+                    pot_error = float('inf')
+            else:
+                print("Warning: Non-finite values in predictions")
+                pot_error = float('inf')
             
-            pot_error = F.mse_loss(pred_potentials_scaled, true_potential_values).item()
-            print(f"Pre-trained potential error: {pot_error:.6f}")
-        
-        nn_model.load_state_dict(init_model.state_dict())
+            if pot_error < 1e3 and pot_error > 0:
+                nn_model.load_state_dict(init_model.state_dict())
+                print(f"Successfully loaded pre-trained weights with error: {pot_error:.6f}")
+            else:
+                print(f"Error too large ({pot_error:.2e}), skipping pre-trained weights")
         
         del init_model, init_optimizer, test_vectors_clone
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -636,15 +727,18 @@ def train_ude(args):
              potentials = torch.zeros_like(distances, device=device)
              force_x = torch.zeros_like(distances, device=device)
 
+        true_forces = torch.zeros_like(test_vectors)
+        for i, r_vec in enumerate(test_vectors):
+            r_pair = torch.stack([r_vec, -r_vec])
+            force_pair = true_potential.compute_force_only(r_pair)
+            true_forces[i] = force_pair[0] 
+        
+        r_tensor = distances.unsqueeze(1)  
+        true_potentials = true_potential.compute(r_tensor).squeeze()
+        
+        true_force_x = true_forces[:, 0]
+
         with torch.no_grad():
-            g_att = potential_params['g_att']
-            g_rep = potential_params['g_rep']
-            m_pi = potential_params['m_pi']
-            m_rho = potential_params['m_rho']
-            term1 = g_rep * torch.exp(-m_rho*distances) * (m_rho/distances + 1/(distances**2))
-            term2 = g_att * torch.exp(-m_pi*distances) * (m_pi/distances + 1/(distances**2))
-            true_force_x = term1 - term2
-            
             max_force = torch.max(torch.abs(force_x)).item()
             mean_force = torch.mean(torch.abs(force_x)).item()
             force_error = torch.mean((force_x - true_force_x) ** 2).item()
@@ -653,7 +747,7 @@ def train_ude(args):
             potentials_np = potentials.cpu().numpy()
             force_x_np = force_x.cpu().numpy()
             
-        return max_force, mean_force, is_zero_like, force_x_np, force_error, potentials_np
+        return max_force, mean_force, is_zero_like, force_x_np, force_error, potentials_np, true_forces.cpu(), true_potentials.cpu()
     
     potential_params = data['potential_params']
     g_att = potential_params['g_att']
@@ -661,7 +755,7 @@ def train_ude(args):
     m_pi = potential_params['m_pi']
     m_rho = potential_params['m_rho']
 
-    initial_max_force, initial_mean_force, _, _, initial_force_error, initial_potentials = check_force_profile(nn_model, device)
+    initial_max_force, initial_mean_force, _, _, initial_force_error, initial_potentials, initial_true_forces, initial_true_potentials = check_force_profile(nn_model, device)
     print(f"Initial force profile: Max={initial_max_force:.4f}, Mean={initial_mean_force:.4f}, Error={initial_force_error:.4f}")
     
     train_losses_epoch = []
@@ -774,9 +868,15 @@ def train_ude(args):
                     if args.model_type == 'kan':
                         symmetry_weight *= 0.3 
                         
-                    combined_loss_batch = (
-                        mse_weight * mse_loss_batch + 
-                        symmetry_weight * symmetry_loss_tensor
+                    combined_loss_batch, loss_components = loss_manager.total_loss(
+                        nn_model, 
+                        r_vectors=all_rel_pos_ij_tensor if len(all_rel_pos_ij) > 0 else torch.zeros((0, 3), device=device),
+                        true_force=current_target_accel_batch.reshape(-1, 3),
+                        positions=current_positions_batch,
+                        velocities=current_target_accel_batch,
+                        masses=None,  
+                        epoch=epoch,
+                        potential_params=potential_params 
                     )
                 
                 accumulation_scale = 1.0 / actual_accumulation_steps
@@ -829,6 +929,13 @@ def train_ude(args):
                     "batch/batch_size": current_batch_actual_size,
                     "batch/global_step": epoch * num_batches + i
                 })
+                
+                if 'shape' in loss_components:
+                    wandb.log({"batch/shape_loss": loss_components['shape']})
+                if 'conservation' in loss_components:
+                    wandb.log({"batch/conservation_loss": loss_components['conservation']})
+                if 'yukawa' in loss_components:
+                    wandb.log({"batch/yukawa_form_loss": loss_components['yukawa']})
             
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
@@ -877,18 +984,28 @@ def train_ude(args):
         avg_epoch_mse = epoch_mse_loss / num_steps_loss
         avg_epoch_sym = epoch_symmetry_loss / num_steps_loss
 
-        max_force, mean_force, is_zero_like, force_profile, force_error, potentials = check_force_profile(nn_model, device)
+        max_force, mean_force, is_zero_like, force_profile, force_error, potentials, true_forces, true_potentials = check_force_profile(nn_model, device)
         force_profile_history.append(force_profile)
         
         train_losses_epoch.append(avg_epoch_loss)
         val_losses_epoch.append(avg_val_loss)
         
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_epoch_loss:.6f}, Val Loss: {avg_val_loss:.6f}, " 
-              f"MSE: {avg_epoch_mse:.6f}, Sym: {avg_epoch_sym:.6f}, " 
+              f"MSE: {avg_epoch_mse:.6f}, Sym: {avg_epoch_sym:.6f}, "
               f"Force Error: {force_error:.6f}, Max Force: {max_force:.6f}")
         
+        if 'shape' in loss_components or 'conservation' in loss_components or 'yukawa' in loss_components:
+            phys_loss_str = "Physical losses: "
+            if 'shape' in loss_components:
+                phys_loss_str += f"Shape={loss_components['shape']:.6f} "
+            if 'conservation' in loss_components:
+                phys_loss_str += f"Conserv={loss_components['conservation']:.6f} "
+            if 'yukawa' in loss_components:
+                phys_loss_str += f"Yukawa={loss_components['yukawa']:.6f}"
+            print(phys_loss_str)
+        
         if args.use_wandb:
-            wandb.log({
+            log_dict = {
                 "epoch/train_loss": avg_epoch_loss,
                 "epoch/val_loss": avg_val_loss,
                 "epoch/mse_loss": avg_epoch_mse,
@@ -897,23 +1014,33 @@ def train_ude(args):
                 "epoch/max_force": max_force,
                 "epoch/mean_force": mean_force,
                 "epoch/is_zero_like": int(is_zero_like),
-                "epoch/learning_rate": optimizer.param_groups[0]['lr'],
-                "epoch/force_profile": wandb.plot.line_series(
-                    xs=numpy.linspace(0.2, 4.0, 40),
-                    ys=[force_profile, 
-                        term1.cpu().numpy() - term2.cpu().numpy()],
-                    keys=["Predicted", "True"],
-                    title="Force Profile",
-                    xname="Distance"
-                ),
-                "epoch/potential_profile": wandb.plot.line_series(
-                    xs=numpy.linspace(0.2, 4.0, 40),
-                    ys=[potentials],
-                    keys=["Potential"],
-                    title="Potential Profile",
-                    xname="Distance"
-                )
-            })
+                "epoch/learning_rate": optimizer.param_groups[0]['lr']
+            }
+            
+            if 'shape' in loss_components:
+                log_dict["epoch/shape_loss"] = loss_components['shape']
+            if 'conservation' in loss_components:
+                log_dict["epoch/conservation_loss"] = loss_components['conservation']
+            if 'yukawa' in loss_components:
+                log_dict["epoch/yukawa_form_loss"] = loss_components['yukawa']
+            
+            log_dict["epoch/force_profile"] = wandb.plot.line_series(
+                xs=numpy.linspace(0.2, 4.0, 40),
+                ys=[force_profile, 
+                    true_forces[:, 0].numpy()],
+                keys=["Predicted", "True"],
+                title="Force Profile",
+                xname="Distance"
+            )
+            log_dict["epoch/potential_profile"] = wandb.plot.line_series(
+                xs=numpy.linspace(0.2, 4.0, 40),
+                ys=[potentials, true_potentials.numpy()],
+                keys=["Predicted", "True"],
+                title="Potential Profile",
+                xname="Distance"
+            )
+            
+            wandb.log(log_dict)
         
         if is_zero_like:
             zero_force_counter += 1
@@ -1481,6 +1608,8 @@ if __name__ == "__main__":
     parser.add_argument('--prediction_steps', type=int, default=500, help='Number of steps for prediction trajectory')
     parser.add_argument('--use_true_potential', action='store_true', help='Use the true potential for analysis comparison')
     parser.add_argument('--skip_initialization', action='store_true', help='Skip pre-training/initialization of the model weights')
+    parser.add_argument('--true_potential_weight', type=float, default=0.5, help='Weight for true potential loss component when using MesonExchangePotential as reference.')
+    parser.add_argument('--use_true_potential_in_training', action='store_true', help='Use true potential information during training, not only for initialization.')
     
     args = parser.parse_args()
 
