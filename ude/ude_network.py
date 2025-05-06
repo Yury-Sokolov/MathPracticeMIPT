@@ -451,8 +451,8 @@ class LossManager:
             pred_dir = torch.zeros_like(pred_force)
             true_dir = torch.zeros_like(true_force)
             
-            pred_dir[valid_mask.squeeze(-1)] = pred_force[valid_mask.squeeze(-1)] / pred_norm[valid_mask]
-            true_dir[valid_mask.squeeze(-1)] = true_force[valid_mask.squeeze(-1)] / true_norm[valid_mask]
+            pred_dir[valid_mask.squeeze(-1)] = pred_force[valid_mask.squeeze(-1)] / pred_norm[valid_mask.squeeze(-1)]
+            true_dir[valid_mask.squeeze(-1)] = true_force[valid_mask.squeeze(-1)] / true_norm[valid_mask.squeeze(-1)]
             
             cos_sim = F.cosine_similarity(pred_dir, true_dir, dim=-1)
             cos_sim = torch.clamp(cos_sim, min=-1.0, max=1.0)  
@@ -636,7 +636,6 @@ class LossManager:
         energy_diff = torch.abs(total_energy_final - total_energy_initial)
         conservation_loss = torch.mean(energy_diff)
         
-        # Проверка на конечность результата
         if torch.isfinite(conservation_loss):
             return conservation_loss
         else:
