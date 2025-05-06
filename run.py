@@ -237,8 +237,7 @@ def train_ude(args):
             'clip_grad': args.clip_grad,
             'patience': args.patience,
             'model_type': args.model_type,
-            'device': args.device,
-            'smoothness_weight': 0.0
+            'device': args.device
         }
         
         run = wandb.init(
@@ -383,7 +382,6 @@ def train_ude(args):
     loss_manager = LossManager(
         potential_weight=0.5,
         force_weight=1.0,
-        smoothness_weight=0.0,
         symmetric_weight=args.symmetry_weight
     )
     
@@ -669,8 +667,6 @@ def train_ude(args):
         epoch_loss = 0.0
         epoch_mse_loss = 0.0
         epoch_symmetry_loss = 0.0
-        epoch_force_magnitude_loss = 0.0
-        epoch_smoothness_loss = 0.0
         
         permuted_indices = torch.randperm(num_steps_loss).tolist()
 
@@ -690,8 +686,6 @@ def train_ude(args):
             batch_loss = 0.0
             batch_mse_loss = 0.0
             batch_symmetry_loss = 0.0
-            batch_force_magnitude_loss = 0.0
-            batch_smoothness_loss = 0.0
             
             actual_accumulation_steps = min(accumulation_steps, num_batches - i)
             
@@ -725,8 +719,6 @@ def train_ude(args):
                     )
                     
                     symmetry_loss_tensor = torch.tensor(0.0, device=device)
-                    smoothness_loss_tensor = torch.tensor(0.0, device=device)
-                    magnitude_loss_tensor = torch.tensor(0.0, device=device)
                     
                     if n_particles > 1:
                         num_pairs_per_instance = min(3 if args.model_type == 'kan' else 5, n_particles * (n_particles - 1) // 2) 
@@ -736,7 +728,6 @@ def train_ude(args):
                                                           device=device)
                         
                         all_rel_pos_ij = []
-                        all_true_potentials = []
                         
                         for b_idx in range(batch_actual_size):
                             instance_positions = current_positions_batch[b_idx]
@@ -755,62 +746,33 @@ def train_ude(args):
 
                                 if r_norm > 1e-6:
                                     all_rel_pos_ij.append(rel_pos_ij.unsqueeze(0))
-                                    
-                                    if epoch % 3 == 0 and r_norm > 0.2 and r_norm < r_cutoff:
-                                        true_pot = (g_rep * torch.exp(-m_rho*r_norm) / r_norm - g_att * torch.exp(-m_pi*r_norm) / r_norm)
-                                        all_true_potentials.append(true_pot.unsqueeze(0))
-                                    else:
-                                        all_true_potentials.append(torch.tensor([torch.nan], device=device))
 
                         if len(all_rel_pos_ij) > 0:
                             all_rel_pos_ij_tensor = torch.cat(all_rel_pos_ij, dim=0).requires_grad_(True)
-                            all_true_potentials_tensor = torch.cat(all_true_potentials, dim=0)
                             
                             symmetry_loss_tensor = loss_manager.symmetry_loss(nn_model, all_rel_pos_ij_tensor)
-                            smoothness_loss_tensor = loss_manager.smoothness_loss(nn_model, all_rel_pos_ij_tensor)
-                            
-                            valid_pot_indices = ~torch.isnan(all_true_potentials_tensor)
-                            if torch.any(valid_pot_indices):
-                                valid_rel_pos = all_rel_pos_ij_tensor[valid_pot_indices]
-                                valid_true_pots = all_true_potentials_tensor[valid_pot_indices]
-                                
-                                if valid_rel_pos.shape[0] > 0:
-                                    pred_pot_magnitude = nn_model.compute_potential(valid_rel_pos)
-                                    magnitude_loss_tensor = F.mse_loss(pred_pot_magnitude, valid_true_pots)
-                                     
+                        else: 
+                            symmetry_loss_tensor = torch.tensor(0.0, device=device)
+                             
                     else: 
                          symmetry_loss_tensor = torch.tensor(0.0, device=device)
-                         smoothness_loss_tensor = torch.tensor(0.0, device=device)
-                         magnitude_loss_tensor = torch.tensor(0.0, device=device)
                          
                     if epoch < args.epochs // 10:
                         mse_weight = 1.0
                         symmetry_weight = args.symmetry_weight * 0.2
-                        smoothness_weight = 0.0
-                        force_magnitude_weight = 0.2
                     elif epoch > args.epochs * 0.8:
                         mse_weight = 0.8
                         symmetry_weight = args.symmetry_weight * 1.5
-                        smoothness_weight = 0.0
-                        force_magnitude_weight = 1.5
                     else:
                         mse_weight = 1.0
                         symmetry_weight = args.symmetry_weight
-                        smoothness_weight = 0.0
-                        force_magnitude_weight = 1.0
                     
-                    if zero_force_counter > 1:
-                        force_magnitude_weight *= 3.0
-                        
                     if args.model_type == 'kan':
                         symmetry_weight *= 0.3 
-                        smoothness_weight *= 0.3
                         
                     combined_loss_batch = (
                         mse_weight * mse_loss_batch + 
-                        symmetry_weight * symmetry_loss_tensor + 
-                        smoothness_weight * smoothness_loss_tensor + 
-                        force_magnitude_weight * magnitude_loss_tensor 
+                        symmetry_weight * symmetry_loss_tensor
                     )
                 
                 accumulation_scale = 1.0 / actual_accumulation_steps
@@ -819,8 +781,6 @@ def train_ude(args):
                 
                 batch_mse_loss += mse_loss_batch.item() * accumulation_scale
                 batch_symmetry_loss += symmetry_loss_tensor.item() * accumulation_scale 
-                batch_smoothness_loss += smoothness_loss_tensor.item() * accumulation_scale
-                batch_force_magnitude_loss += magnitude_loss_tensor.item() * accumulation_scale
                 batch_loss += combined_loss_batch.item() * accumulation_scale
                 
                 del current_positions_batch, current_target_accel_batch, predicted_accels_batch, predicted_accels_norm_batch
@@ -835,8 +795,6 @@ def train_ude(args):
             avg_batch_loss = batch_loss 
             avg_batch_mse = batch_mse_loss
             avg_batch_sym = batch_symmetry_loss
-            avg_batch_smooth = batch_smoothness_loss
-            avg_batch_mag = batch_force_magnitude_loss
             
             if torch.isnan(torch.tensor(avg_batch_loss)) or torch.isinf(torch.tensor(avg_batch_loss)):
                 print(f"\nWarning: NaN/Inf loss detected in epoch {epoch+1}, batch {i+1}")
@@ -847,16 +805,12 @@ def train_ude(args):
             epoch_loss += batch_loss
             epoch_mse_loss += batch_mse_loss
             epoch_symmetry_loss += batch_symmetry_loss
-            epoch_smoothness_loss += batch_smoothness_loss
-            epoch_force_magnitude_loss += batch_force_magnitude_loss
 
             current_lr = optimizer.param_groups[0]['lr']
             batch_pbar.set_postfix({
                 "Loss": f"{avg_batch_loss:.4e}", 
                 "MSE": f"{avg_batch_mse:.4e}", 
                 "Sym": f"{avg_batch_sym:.4e}",
-                "Smooth": f"{avg_batch_smooth:.4e}",
-                "Mag": f"{avg_batch_mag:.4e}",
                 "LR": f"{current_lr:.3e}",
                 "Mem": f"{torch.cuda.max_memory_allocated() / 1e9:.2f}GB" if torch.cuda.is_available() else "N/A"
             })
@@ -866,8 +820,6 @@ def train_ude(args):
                     "batch/loss": avg_batch_loss,
                     "batch/mse_loss": avg_batch_mse,
                     "batch/symmetry_loss": avg_batch_sym,
-                    "batch/smoothness_loss": avg_batch_smooth,
-                    "batch/force_magnitude_loss": avg_batch_mag,
                     "batch/learning_rate": current_lr,
                     "batch/memory_usage_gb": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
                     "batch/batch_size": current_batch_actual_size,
@@ -920,8 +872,6 @@ def train_ude(args):
         avg_epoch_loss = epoch_loss / num_steps_loss
         avg_epoch_mse = epoch_mse_loss / num_steps_loss
         avg_epoch_sym = epoch_symmetry_loss / num_steps_loss
-        avg_epoch_smooth = epoch_smoothness_loss / num_steps_loss
-        avg_epoch_mag = epoch_force_magnitude_loss / num_steps_loss
 
         max_force, mean_force, is_zero_like, force_profile, force_error, potentials = check_force_profile(nn_model, device)
         force_profile_history.append(force_profile)
@@ -930,7 +880,7 @@ def train_ude(args):
         val_losses_epoch.append(avg_val_loss)
         
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_epoch_loss:.6f}, Val Loss: {avg_val_loss:.6f}, " 
-              f"MSE: {avg_epoch_mse:.6f}, Sym: {avg_epoch_sym:.6f}, Smooth: {avg_epoch_smooth:.6f}, Mag: {avg_epoch_mag:.6f}, " 
+              f"MSE: {avg_epoch_mse:.6f}, Sym: {avg_epoch_sym:.6f}, " 
               f"Force Error: {force_error:.6f}, Max Force: {max_force:.6f}")
         
         if args.use_wandb:
@@ -939,8 +889,6 @@ def train_ude(args):
                 "epoch/val_loss": avg_val_loss,
                 "epoch/mse_loss": avg_epoch_mse,
                 "epoch/symmetry_loss": avg_epoch_sym,
-                "epoch/smoothness_loss": avg_epoch_smooth,
-                "epoch/force_magnitude_loss": avg_epoch_mag,
                 "epoch/force_error": force_error,
                 "epoch/max_force": max_force,
                 "epoch/mean_force": mean_force,
@@ -1523,7 +1471,6 @@ if __name__ == "__main__":
     parser.add_argument('--max_potential', type=float, default=50.0, help='Maximum potential value for scaling in the PotentialNN model (reduced).')
     parser.add_argument('--model_type', type=str, default='potential_nn', choices=['potential_nn', 'kan'], help='Type of neural network model to use.')
     parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout rate for the PotentialNN model.')
-    parser.add_argument('--smoothness_weight', type=float, default=0.0, help='Weight for smoothness loss in the physics-informed loss function.')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'adam', 'sgd'], help='Optimizer to use.')
     parser.add_argument('--scheduler_type', type=str, default='one_cycle', choices=['one_cycle', 'cosine', 'reduce_on_plateau'], help='Scheduler type to use.')
     parser.add_argument('--plot_results', action='store_true', help='Create plots of results')

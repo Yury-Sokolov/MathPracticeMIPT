@@ -300,11 +300,9 @@ class KANPotentialModel(nn.Module):
 
 class LossManager:
     """Class to handle different loss functions and combinations"""
-    def __init__(self, potential_weight=1.0, force_weight=1.0, 
-                 smoothness_weight=0.0, symmetric_weight=0.5):
+    def __init__(self, potential_weight=1.0, force_weight=1.0, symmetric_weight=0.5):
         self.potential_weight = potential_weight
         self.force_weight = force_weight
-        self.smoothness_weight = 0.0  # Всегда устанавливаем в 0
         self.symmetric_weight = symmetric_weight
         
     def potential_loss(self, pred_potential, true_potential):
@@ -322,10 +320,6 @@ class LossManager:
         direction_loss = 1.0 - F.cosine_similarity(pred_dir, true_dir, dim=-1).mean()
         
         return mse_loss + 0.2 * mae_loss + 0.3 * direction_loss
-    
-    def smoothness_loss(self, model, r_vectors):
-
-        return torch.tensor(0.0, device=r_vectors.device)
     
     def symmetry_loss(self, model, r_vectors):
         """Enforce rotational symmetry"""
@@ -366,8 +360,6 @@ class LossManager:
             pred_potential = model.compute_potential(r_vectors)
             potential_l = self.potential_loss(pred_potential, true_potential)
         
-        smoothness_l = 0
-        
         symmetry_l = 0
         if self.symmetric_weight > 0:
             symmetry_l = self.symmetry_loss(model, r_vectors)
@@ -375,14 +367,12 @@ class LossManager:
         total = (
             self.force_weight * force_l + 
             self.potential_weight * potential_l +
-            self.smoothness_weight * smoothness_l +
             self.symmetric_weight * symmetry_l
         )
         
         loss_components = {
             'force': force_l.item(),
             'potential': potential_l.item() if isinstance(potential_l, torch.Tensor) else 0,
-            'smoothness': 0.0, 
             'symmetry': symmetry_l.item() if isinstance(symmetry_l, torch.Tensor) else 0,
             'total': total.item()
         }
