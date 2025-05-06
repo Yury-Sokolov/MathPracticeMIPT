@@ -237,7 +237,8 @@ def train_ude(args):
             'clip_grad': args.clip_grad,
             'patience': args.patience,
             'model_type': args.model_type,
-            'device': args.device
+            'device': args.device,
+            'skip_initialization': args.skip_initialization
         }
         
         run = wandb.init(
@@ -385,129 +386,132 @@ def train_ude(args):
         symmetric_weight=args.symmetry_weight
     )
     
-    print("Pre-initializing weights to match true potential curve...")
-    r_cutoff = potential_params.get('r_cutoff', 5.0)
-    
-    test_dists_close = torch.linspace(0.01, 1.0, 1000, device=device)
-    test_dists_far = torch.linspace(1.0, r_cutoff, 1000, device=device)
-    test_dists = torch.cat([test_dists_close, test_dists_far[1:]])
-    
-    test_vectors = torch.zeros((len(test_dists), 3), device=device)
-    test_vectors[:, 0] = test_dists
-    
-    g_att = potential_params['g_att']
-    g_rep = potential_params['g_rep']
-    m_pi = potential_params['m_pi']
-    m_rho = potential_params['m_rho']
-    
-    true_potential_values = g_rep * torch.exp(-m_rho*test_dists) / test_dists - g_att * torch.exp(-m_pi*test_dists) / test_dists
-    true_potential_values -= torch.min(true_potential_values)
-
-    term1 = g_rep * torch.exp(-m_rho*test_dists) * (m_rho/test_dists + 1/(test_dists**2))
-    term2 = g_att * torch.exp(-m_pi*test_dists) * (m_pi/test_dists + 1/(test_dists**2))
-    true_force_magnitudes = term1 - term2
-    
-    true_forces = torch.zeros_like(test_vectors)
-    true_forces[:, 0] = true_force_magnitudes
-    
-    init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
-    
-    print("Pre-training neural network...")
-    for pre_epoch in tqdm(range(30), desc="Pre-training"):
-        init_optimizer.zero_grad()
+    if not args.skip_initialization:
+        print("Pre-initializing weights to match true potential curve...")
+        r_cutoff = potential_params.get('r_cutoff', 5.0)
         
-        with torch.enable_grad():
-            test_vectors_clone = test_vectors.clone().requires_grad_(True)
+        test_dists_close = torch.linspace(0.01, 1.0, 1000, device=device)
+        test_dists_far = torch.linspace(1.0, r_cutoff, 1000, device=device)
+        test_dists = torch.cat([test_dists_close, test_dists_far[1:]])
+        
+        test_vectors = torch.zeros((len(test_dists), 3), device=device)
+        test_vectors[:, 0] = test_dists
+        
+        g_att = potential_params['g_att']
+        g_rep = potential_params['g_rep']
+        m_pi = potential_params['m_pi']
+        m_rho = potential_params['m_rho']
+        
+        true_potential_values = g_rep * torch.exp(-m_rho*test_dists) / test_dists - g_att * torch.exp(-m_pi*test_dists) / test_dists
+        true_potential_values -= torch.min(true_potential_values)
+
+        term1 = g_rep * torch.exp(-m_rho*test_dists) * (m_rho/test_dists + 1/(test_dists**2))
+        term2 = g_att * torch.exp(-m_pi*test_dists) * (m_pi/test_dists + 1/(test_dists**2))
+        true_force_magnitudes = term1 - term2
+        
+        true_forces = torch.zeros_like(test_vectors)
+        true_forces[:, 0] = true_force_magnitudes
+        
+        init_optimizer = optim.Adam(init_model.parameters(), lr=0.01)
+        
+        print("Pre-training neural network...")
+        for pre_epoch in tqdm(range(30), desc="Pre-training"):
+            init_optimizer.zero_grad()
+            
+            with torch.enable_grad():
+                test_vectors_clone = test_vectors.clone().requires_grad_(True)
+                
+                if args.model_type == 'kan':
+                    pred_potentials = init_model.compute_potential(test_vectors_clone)
+                    pred_min = torch.min(pred_potentials)
+                    pred_potentials = pred_potentials - pred_min
+                    
+                    max_true = torch.max(true_potential_values)
+                    max_pred = torch.max(pred_potentials.detach())
+                    
+                    if max_pred > 1e-6:
+                        pred_scale = max_true / max_pred
+                    else:
+                        pred_scale = 1.0
+                        
+                    pred_potentials_scaled = pred_potentials * pred_scale
+                    pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
+
+                    total_potential_sum = torch.sum(pred_potentials_scaled)
+                    pred_forces = -torch.autograd.grad(
+                        total_potential_sum, test_vectors_clone,
+                        create_graph=True, retain_graph=True
+                    )[0]
+                    
+                    weights = 1.0 / (test_dists.detach() + 0.5)
+                    weights = weights / weights.sum() 
+                    force_diff = (pred_forces - true_forces) ** 2
+                    force_loss = torch.sum(weights.unsqueeze(1) * force_diff) 
+
+                    combined_loss = pot_loss + 5.0 * force_loss 
+                    combined_loss.backward()
+                    
+                    total_pot_loss = pot_loss.item()
+                    total_force_loss = force_loss.item()
+                else:
+                    pred_potentials = init_model.compute_potential(test_vectors_clone)
+                    
+                    pred_min = torch.min(pred_potentials)
+                    pred_potentials = pred_potentials - pred_min
+                    pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials.detach())
+                    pred_potentials_scaled = pred_potentials * pred_scale
+                    
+                    pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
+                    
+                    total_potential = torch.sum(pred_potentials_scaled)
+                    pred_forces = -torch.autograd.grad(
+                        total_potential, test_vectors_clone, 
+                        create_graph=True, retain_graph=True
+                    )[0]
+                    
+                    weights = 1.0 / (test_dists.detach() + 0.5)
+                    weights = weights / weights.sum()
+                    force_diff = (pred_forces - true_forces) ** 2
+                    force_loss = torch.sum(weights.unsqueeze(1) * force_diff)
+                    
+                    combined_loss = pot_loss + 5.0 * force_loss
+                    combined_loss.backward()
+                    
+                    total_pot_loss = pot_loss.item()
+                    total_force_loss = force_loss.item()
+            
+            torch.nn.utils.clip_grad_norm_(init_model.parameters(), 1.0)
+            init_optimizer.step()
             
             if args.model_type == 'kan':
-                pred_potentials = init_model.compute_potential(test_vectors_clone)
-                pred_min = torch.min(pred_potentials)
-                pred_potentials = pred_potentials - pred_min
-                
-                max_true = torch.max(true_potential_values)
-                max_pred = torch.max(pred_potentials.detach())
-                
-                if max_pred > 1e-6:
-                    pred_scale = max_true / max_pred
-                else:
-                    pred_scale = 1.0
-                    
-                pred_potentials_scaled = pred_potentials * pred_scale
-                pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
-
-                total_potential_sum = torch.sum(pred_potentials_scaled)
-                pred_forces = -torch.autograd.grad(
-                    total_potential_sum, test_vectors_clone,
-                    create_graph=True, retain_graph=True
-                )[0]
-                
-                weights = 1.0 / (test_dists.detach() + 0.5)
-                weights = weights / weights.sum() 
-                force_diff = (pred_forces - true_forces) ** 2
-                force_loss = torch.sum(weights.unsqueeze(1) * force_diff) 
-
-                combined_loss = pot_loss + 5.0 * force_loss 
-                combined_loss.backward()
-                
-                total_pot_loss = pot_loss.item()
-                total_force_loss = force_loss.item()
+                print(f"  Pre-train epoch {pre_epoch+1}: Pot Loss={total_pot_loss:.6f}, Force Loss={total_force_loss:.6f}")
+        
+        with torch.no_grad():
+            if args.model_type == 'kan':
+                pred_potentials = []
+                batch_size = 8
+                for i in range(0, len(test_vectors), batch_size):
+                    batch_vectors = test_vectors[i:i+batch_size]
+                    batch_potentials = init_model.compute_potential(batch_vectors)
+                    pred_potentials.append(batch_potentials)
+                pred_potentials = torch.cat(pred_potentials, dim=0)
             else:
-                pred_potentials = init_model.compute_potential(test_vectors_clone)
+                pred_potentials = init_model.compute_potential(test_vectors)
                 
-                pred_min = torch.min(pred_potentials)
-                pred_potentials = pred_potentials - pred_min
-                pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials.detach())
-                pred_potentials_scaled = pred_potentials * pred_scale
-                
-                pot_loss = F.mse_loss(pred_potentials_scaled, true_potential_values)
-                
-                total_potential = torch.sum(pred_potentials_scaled)
-                pred_forces = -torch.autograd.grad(
-                    total_potential, test_vectors_clone, 
-                    create_graph=True, retain_graph=True
-                )[0]
-                
-                weights = 1.0 / (test_dists.detach() + 0.5)
-                weights = weights / weights.sum()
-                force_diff = (pred_forces - true_forces) ** 2
-                force_loss = torch.sum(weights.unsqueeze(1) * force_diff)
-                
-                combined_loss = pot_loss + 5.0 * force_loss
-                combined_loss.backward()
-                
-                total_pot_loss = pot_loss.item()
-                total_force_loss = force_loss.item()
-        
-        torch.nn.utils.clip_grad_norm_(init_model.parameters(), 1.0)
-        init_optimizer.step()
-        
-        if args.model_type == 'kan':
-            print(f"  Pre-train epoch {pre_epoch+1}: Pot Loss={total_pot_loss:.6f}, Force Loss={total_force_loss:.6f}")
-    
-    with torch.no_grad():
-        if args.model_type == 'kan':
-            pred_potentials = []
-            batch_size = 8
-            for i in range(0, len(test_vectors), batch_size):
-                batch_vectors = test_vectors[i:i+batch_size]
-                batch_potentials = init_model.compute_potential(batch_vectors)
-                pred_potentials.append(batch_potentials)
-            pred_potentials = torch.cat(pred_potentials, dim=0)
-        else:
-            pred_potentials = init_model.compute_potential(test_vectors)
+            pred_min = torch.min(pred_potentials)
+            pred_potentials = pred_potentials - pred_min
+            pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials)
+            pred_potentials_scaled = pred_potentials * pred_scale
             
-        pred_min = torch.min(pred_potentials)
-        pred_potentials = pred_potentials - pred_min
-        pred_scale = torch.max(true_potential_values) / torch.max(pred_potentials)
-        pred_potentials_scaled = pred_potentials * pred_scale
+            pot_error = F.mse_loss(pred_potentials_scaled, true_potential_values).item()
+            print(f"Pre-trained potential error: {pot_error:.6f}")
         
-        pot_error = F.mse_loss(pred_potentials_scaled, true_potential_values).item()
-        print(f"Pre-trained potential error: {pot_error:.6f}")
-    
-    nn_model.load_state_dict(init_model.state_dict())
-    
-    del init_model, init_optimizer, test_vectors_clone
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        nn_model.load_state_dict(init_model.state_dict())
+        
+        del init_model, init_optimizer, test_vectors_clone
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    else:
+        print("Skipping model initialization as requested with --skip_initialization")
     
     sim_model = Simulation(
         potential=None, neural_network=nn_model,
@@ -1476,6 +1480,7 @@ if __name__ == "__main__":
     parser.add_argument('--plot_results', action='store_true', help='Create plots of results')
     parser.add_argument('--prediction_steps', type=int, default=500, help='Number of steps for prediction trajectory')
     parser.add_argument('--use_true_potential', action='store_true', help='Use the true potential for analysis comparison')
+    parser.add_argument('--skip_initialization', action='store_true', help='Skip pre-training/initialization of the model weights')
     
     args = parser.parse_args()
 
